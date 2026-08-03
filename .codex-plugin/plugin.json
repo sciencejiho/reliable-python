@@ -1,0 +1,36 @@
+{
+  "name": "reliable-python",
+  "version": "0.2.0",
+  "description": "Guide and audit Python changes against NASA/JPL's Power of Ten rules and the Refactoring.Guru code-smell catalog",
+  "author": {
+    "name": "Jiho Han",
+    "email": "jihohan@simplatform.com"
+  },
+  "license": "MIT",
+  "keywords": [
+    "python",
+    "code-quality",
+    "code-review",
+    "code-smells",
+    "safety-critical",
+    "power-of-ten",
+    "nasa",
+    "jpl"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Reliable Python",
+    "shortDescription": "Enforce strict Python quality guardrails",
+    "longDescription": "Write and review Python with an intent-preserving adaptation of NASA/JPL's Power of Ten rules, plus semantic checks for the Refactoring.Guru code-smell catalog.",
+    "developerName": "Jiho Han",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Review my Python changes for Power of Ten violations and code smells.",
+      "Refactor this Python code to satisfy the reliability rules."
+    ]
+  }
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Use Power of Ten"
+  short_description: "Apply strict reliable-Python guardrails"
+  default_prompt: "Use $using-power-of-ten while implementing this Python change."

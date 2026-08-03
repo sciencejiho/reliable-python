@@ -1,0 +1,4 @@
+interface:
+  display_name: "Review Code Quality"
+  short_description: "Find Power of Ten and code-smell risks"
+  default_prompt: "Use $review-code-quality to audit this change and fix confirmed findings."

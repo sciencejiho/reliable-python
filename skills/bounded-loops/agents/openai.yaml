@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bound Python Loops"
+  short_description: "Make loop termination explicit and finite"
+  default_prompt: "Use $bounded-loops to make this Python loop provably bounded."
