@@ -30,6 +30,7 @@ PREAMBLE = (
 )
 
 
+# quality: ignore[POT05] - this hook checks file I/O and the injected byte ceiling
 def main() -> int:
     try:
         body = ENTRY_SKILL.read_text(encoding="utf-8")

@@ -19,9 +19,10 @@ from typing import Any
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parent.parent
 AUDITOR = PLUGIN_ROOT / "skills" / "review-code-quality" / "scripts" / "audit_python.py"
 MAX_REPORTED_FINDINGS = 12
-VALID_GATE_LEVELS = {"all", "errors", "off"}
+VALID_GATE_LEVELS = frozenset({"all", "errors", "off"})
 
 
+# quality: ignore[POT05] - module checks JSON, enum, process, timeout, and payload boundaries
 def _read_input() -> dict[str, Any]:
     try:
         value = json.load(sys.stdin)
@@ -77,8 +78,11 @@ def _selected_findings(payload: dict[str, Any], gate_level: str) -> list[dict[st
 def _reason(findings: list[dict[str, Any]]) -> str:
     lines = [
         "The Reliable Python gate found changed Python that needs another pass.",
-        "Fix confirmed findings, or add a narrow '# quality: ignore[ID] - rationale' only for a proven false positive, then rerun the audit.",
+        "Fix confirmed findings, or add a narrow "
+        "'# quality: ignore[ID] - rationale' only for a proven false positive, "
+        "then rerun the audit.",
     ]
+    # quality: ignore[POT02] - the cap is paired with an explicit remainder count below
     for finding in findings[:MAX_REPORTED_FINDINGS]:
         path = finding.get("path", "<unknown>")
         line = finding.get("line", 1)

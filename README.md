@@ -128,3 +128,9 @@ python3 -m unittest discover -s tests -v
 claude plugin validate .
 python3 /path/to/plugin-creator/scripts/validate_plugin.py .
 ```
+
+## Contributing
+
+This repository uses Git Flow and unscoped Conventional Commits. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for branch roles, release tagging, and commit
+examples.
