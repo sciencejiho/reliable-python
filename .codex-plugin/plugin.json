@@ -1,6 +1,6 @@
 {
   "name": "reliable-python",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Guide and audit Python changes against NASA/JPL's Power of Ten rules and the Refactoring.Guru code-smell catalog",
   "author": {
     "name": "Jiho Han",
