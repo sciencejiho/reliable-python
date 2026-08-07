@@ -20,6 +20,8 @@ PLUGIN_ROOT = pathlib.Path(__file__).resolve().parent.parent
 AUDITOR = PLUGIN_ROOT / "skills" / "review-code-quality" / "scripts" / "audit_python.py"
 MAX_REPORTED_FINDINGS = 12
 VALID_GATE_LEVELS = frozenset({"all", "errors", "off"})
+VALID_DOCSTRING_STYLES = frozenset({"numpy", "google", "rest", "any"})
+DEFAULT_DOCSTRING_STYLE = "numpy"
 
 
 # quality: ignore[POT05] - module checks JSON, enum, process, timeout, and payload boundaries
@@ -37,7 +39,31 @@ def _emit(value: dict[str, Any]) -> int:
     return 0
 
 
-def _run_audit(cwd: pathlib.Path) -> tuple[dict[str, Any] | None, str | None]:
+def _docstring_style() -> str:
+    requested = os.environ.get("RELIABLE_PYTHON_DOCSTYLE", DEFAULT_DOCSTRING_STYLE).lower()
+    return requested if requested in VALID_DOCSTRING_STYLES else DEFAULT_DOCSTRING_STYLE
+
+
+def _style_notice() -> str:
+    requested = os.environ.get("RELIABLE_PYTHON_DOCSTYLE")
+    if requested is None or requested.lower() in VALID_DOCSTRING_STYLES:
+        return ""
+    return (
+        f"Ignoring invalid RELIABLE_PYTHON_DOCSTYLE={requested!r}; "
+        f"auditing as {DEFAULT_DOCSTRING_STYLE}."
+    )
+
+
+def _with_notice(payload: dict[str, Any], notice: str) -> dict[str, Any]:
+    if not notice:
+        return payload
+    existing = payload.get("systemMessage", "")
+    return {**payload, "systemMessage": f"{notice}\n{existing}" if existing else notice}
+
+
+def _run_audit(
+    cwd: pathlib.Path, docstring_style: str
+) -> tuple[dict[str, Any] | None, str | None]:
     try:
         result = subprocess.run(
             [
@@ -48,6 +74,8 @@ def _run_audit(cwd: pathlib.Path) -> tuple[dict[str, Any] | None, str | None]:
                 "json",
                 "--fail-on",
                 "none",
+                "--docstring-style",
+                docstring_style,
             ],
             cwd=cwd,
             check=False,
@@ -98,6 +126,19 @@ def _reason(findings: list[dict[str, Any]]) -> str:
 
 
 def main() -> int:
+    """Audit the changed Python scope and decide whether the turn may stop.
+
+    Reads the host's Stop payload on stdin and writes the decision on stdout.
+    `RELIABLE_PYTHON_GATE` selects which severities block, and
+    `RELIABLE_PYTHON_DOCSTYLE` selects the expected docstring convention.
+
+    Returns
+    -------
+    int
+        Always ``0``. Infrastructure failures fail open with an explanatory
+        message rather than blocking the turn, and a second consecutive stop is
+        always allowed so the hook cannot loop.
+    """
     hook_input = _read_input()
     gate_level = os.environ.get("RELIABLE_PYTHON_GATE", "all").lower()
     if gate_level not in VALID_GATE_LEVELS:
@@ -111,24 +152,25 @@ def main() -> int:
         )
     if gate_level == "off":
         return _emit({})
+    notice = _style_notice()
     cwd = pathlib.Path(str(hook_input.get("cwd", pathlib.Path.cwd())))
-    payload, error = _run_audit(cwd)
+    payload, error = _run_audit(cwd, _docstring_style())
     if error or payload is None:
-        return _emit({"systemMessage": f"Reliable-code gate skipped: {error}"})
+        skipped = {"systemMessage": f"Reliable-code gate skipped: {error}"}
+        return _emit(_with_notice(skipped, notice))
     findings = _selected_findings(payload, gate_level)
     if not findings:
-        return _emit({})
+        return _emit(_with_notice({}, notice))
     reason = _reason(findings)
     if hook_input.get("stop_hook_active"):
-        return _emit(
-            {
-                "systemMessage": (
-                    "Reliable-code findings remain after one continuation; "
-                    "allowing the turn to stop to avoid a hook loop.\n" + reason
-                )
-            }
-        )
-    return _emit({"decision": "block", "reason": reason})
+        exhausted = {
+            "systemMessage": (
+                "Reliable-code findings remain after one continuation; "
+                "allowing the turn to stop to avoid a hook loop.\n" + reason
+            )
+        }
+        return _emit(_with_notice(exhausted, notice))
+    return _emit(_with_notice({"decision": "block", "reason": reason}, notice))
 
 
 if __name__ == "__main__":

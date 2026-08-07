@@ -32,6 +32,15 @@ PREAMBLE = (
 
 # quality: ignore[POT05] - this hook checks file I/O and the injected byte ceiling
 def main() -> int:
+    """Print the SessionStart payload carrying the shared policy text.
+
+    Returns
+    -------
+    int
+        Always ``0``. A hook that cannot read or size the entry skill reports
+        the problem on stderr and still exits successfully, because a broken
+        hook must never block the user's session.
+    """
     try:
         body = ENTRY_SKILL.read_text(encoding="utf-8")
     except OSError as exc:
