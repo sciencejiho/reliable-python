@@ -85,7 +85,7 @@ review workflow reads but the session never injects.
 **3. Checker (`skills/review-code-quality/scripts/audit_python.py`).** One
 dependency-free AST pass, ~1,700 lines. `analyze_source` is the seam worth
 knowing: it builds a `ReviewContext` (tree, source lines, path, parent map,
-findings list, docstring style) and hands it to nine `_check_*` functions, each
+findings list, docstring style) and hands it to ten `_check_*` functions, each
 of which reports through `context.report`. Adding a rule means adding a
 `_check_*` function and one call there.
 
@@ -124,7 +124,8 @@ which shapes how you write code here:
   module-level uppercase constant reads as bounded; `for x in some_list` does
   not and needs a suppression. Comprehensions are not analyzed as loops, so
   prefer them for genuinely bounded projections.
-- **Functions cap at 60 code lines**, docstrings excluded from the count.
+- **Functions cap at 60 code lines**, docstrings excluded from the count, and
+  **four levels of block nesting**. An `elif` ladder counts as one level.
 - **Public definitions need docstrings in the configured convention** — NumPy by
   default, resolved from `--docstring-style`, then `RELIABLE_PYTHON_DOCSTYLE`,
   then `[tool.reliable-python] docstring-style` in `pyproject.toml`. The checker
