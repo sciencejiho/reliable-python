@@ -148,8 +148,13 @@ equivalents. The docstring convention is documented as a *project convention*
 rather than an eleventh rule for the same reason.
 
 Git Flow with unscoped Conventional Commits; `develop` integrates, `main` holds
-tagged releases. See `CONTRIBUTING.md`. Version numbers appear in three files
-(`.claude-plugin/plugin.json`, `.codex-plugin/plugin.json`,
-`.claude-plugin/marketplace.json`) and `PackageConsistencyTests` fails if they
-drift — that test hardcodes the expected version, so a release bump edits four
-places.
+tagged releases. See `CONTRIBUTING.md`.
+
+A release bump edits **five** places:
+
+1. `.claude-plugin/plugin.json`
+2. `.codex-plugin/plugin.json`
+3. `.claude-plugin/marketplace.json`
+4. `PackageConsistencyTests` — it hardcodes the expected version and fails on
+   drift, which is the only one of these that is self-enforcing
+5. The version badge in `README.md` — **not** covered by any test
