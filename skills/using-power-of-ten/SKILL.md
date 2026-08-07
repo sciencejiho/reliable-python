@@ -47,6 +47,15 @@ structural change or review.
     with zero warnings in the changed scope; fix confusing code instead of
     silencing tools without a written reason.
 
+## Documentation convention
+
+This is a project convention, not one of Holzmann's ten rules. Document every
+public module, class, and function with a **NumPy-style** docstring; it carries
+per-parameter types, defaults, and constraints that a reader needs to enumerate
+a function's inputs. Google and reST style are acceptable when the file already
+uses them consistently. Load `writing-docstrings` before writing or restructuring
+a docstring.
+
 ## Workflow
 
 Before editing, inspect repository guidance and existing validation commands.

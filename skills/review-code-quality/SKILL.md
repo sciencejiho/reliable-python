@@ -22,16 +22,21 @@ rule violations from heuristic design smells and avoid speculative findings.
    ```
 
    For explicit files or directories, replace `--git-diff` with their paths.
-   The checker covers only high-signal, statically detectable cases; it does
-   not replace the semantic pass.
+   Add `--docstring-style google|rest|any` when the project does not use the
+   NumPy default. The checker covers only high-signal, statically detectable
+   cases; it does not replace the semantic pass.
 4. Trace the ten rules in order. For Rules 3, 8, and 9, label conclusions as
    Python-profile findings rather than literal C-rule compliance.
 5. Review the touched design against all five smell families. Report a smell
    only when the code shows the catalog's signal and a concrete maintenance or
    correctness cost.
-6. Run the repository's own formatter, linter, type checker, and focused tests.
+6. Check the documentation convention on changed public units (`DOC01`-`DOC03`).
+   Read `../writing-docstrings/SKILL.md` before reporting a docstring finding.
+   A summary-only docstring satisfies every supported style and is not a
+   finding on its own.
+7. Run the repository's own formatter, linter, type checker, and focused tests.
    Do not substitute the bundled checker for project validation.
-7. If asked to fix findings, make the smallest behavior-preserving change,
+8. If asked to fix findings, make the smallest behavior-preserving change,
    rerun checks, and re-review the resulting diff.
 
 ## Finding standard
