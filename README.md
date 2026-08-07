@@ -143,6 +143,7 @@ bury you in findings about code you did not touch.
 |---|---|---|
 | **using-power-of-ten** | Every session | Entry policy: the ten rules, the smell catalog, and the workflow that ties them together |
 | **bounded-loops** | On demand | Rule 2 in depth — retries, polling, pagination, convergence, stream consumption |
+| **limiting-nesting** | On demand | Rule 1 in depth — keeping block depth at four levels or fewer |
 | **writing-docstrings** | On demand | NumPy-default documentation convention, with Google and reST as alternates |
 | **review-code-quality** | On demand | Structured audit workflow and the bundled static checker |
 
@@ -155,20 +156,38 @@ The entry skill is injected into every session, so it is kept under a hard
 | Namespace | Covers |
 |---|---|
 | `POT01`–`POT10` | Power of Ten, Python profile — see [references/power-of-ten.md](skills/using-power-of-ten/references/power-of-ten.md) |
-| `CS01`–`CS23` | Refactoring.Guru smells in catalog order — see [references/code-smells.md](skills/using-power-of-ten/references/code-smells.md) |
+| `CS01`–`CS23` | Refactoring.Guru smells in catalog order — see [references/code-smells.md](skills/using-power-of-ten/references/code-smells.md); `CS01` also covers [nesting depth](#nesting-depth) |
 | `DOC01`–`DOC03` | Docstring convention — see [Docstrings](#docstrings) |
 
 The checker recognizes high-signal cases including recursive call cycles,
 unbounded loops, resource growth inside those loops, functions over 60 lines,
 low defensive-check density, mutable defaults, broad swallowed exceptions,
 dynamic execution, deep attribute chains, long parameter lists, unreachable
-code, data clumps, duplicate function bodies, several class-level smells, and
-undocumented or inconsistently documented public definitions.
+code, data clumps, duplicate function bodies, several class-level smells,
+blocks nested more than four levels deep, and undocumented or inconsistently
+documented public definitions.
 
 Design-sensitive smells — divergent change, shotgun surgery, speculative
 generality — stay a semantic review responsibility. No static checker can
 confirm them, and the skill is explicit that a smell needs a demonstrated cost
 before it becomes a finding.
+
+## Nesting depth
+
+A function may nest blocks four levels deep; the function body is level one.
+Past that, the checker reports `CS01` (Long Method), whose catalog signal
+explicitly includes deep nesting, anchored at the deepest statement rather than
+the definition:
+
+```text
+CS01: function collect_errors nests 5 levels deep (limit: 4)
+  remedy: Extract the inner block into a named function, or invert a condition
+          to return early and remove a level.
+```
+
+An `if`/`elif` ladder counts as one level, not one per branch — it reads as a
+single flat decision. `POT04` covers the other half of `CS01`: a function over
+60 code lines. The `limiting-nesting` skill covers the techniques.
 
 ## Docstrings
 
@@ -288,6 +307,7 @@ hooks/
 skills/
   using-power-of-ten/       # entry policy and detailed references
   bounded-loops/            # focused Rule 2 workflow
+  limiting-nesting/         # focused Rule 1 nesting-depth workflow
   writing-docstrings/       # NumPy-default documentation convention
   review-code-quality/      # audit workflow and static checker
 tests/

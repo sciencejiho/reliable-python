@@ -64,6 +64,20 @@ DYNAMIC_BUILTINS = frozenset({"__import__", "compile", "eval", "exec"})
 REFLECTION_BUILTINS = frozenset({"delattr", "getattr", "setattr"})
 MUTATING_METHODS = frozenset({"add", "append", "extend", "insert", "setdefault", "update"})
 TERMINATORS = (ast.Break, ast.Continue, ast.Raise, ast.Return)
+MAX_BLOCK_DEPTH = 4
+NESTING_STATEMENTS = (
+    ast.AsyncFor,
+    ast.AsyncFunctionDef,
+    ast.AsyncWith,
+    ast.ClassDef,
+    ast.For,
+    ast.FunctionDef,
+    ast.If,
+    ast.Match,
+    ast.Try,
+    ast.While,
+    ast.With,
+)
 MAX_DOCSTRING_LINES = 2_000
 MAX_CONFIG_BYTES = 1_000_000
 MAX_CONFIG_SEARCH_DEPTH = 64
@@ -477,6 +491,56 @@ def _register_python_file(candidate: Path, seen: set[Path]) -> Path | None:
     return resolved
 
 
+def _validated_input_path(supplied: Path) -> Path:
+    path = supplied.resolve()
+    if not path.exists():
+        raise AuditError(f"audit path does not exist: {supplied}")
+    if not path.is_file() and not path.is_dir():
+        raise AuditError(f"audit path is not a regular file or directory: {supplied}")
+    if path.is_file() and path.suffix != ".py":
+        raise AuditError(f"audit path is not Python source: {supplied}")
+    return path
+
+
+def _classify_entry(entry: os.DirEntry, seen: set[Path]) -> tuple[Path | None, Path | None]:
+    candidate = Path(entry.path)
+    if entry.is_dir(follow_symlinks=False):
+        return (None, None) if entry.name in EXCLUDED_DIRECTORIES else (candidate, None)
+    if candidate.suffix == ".py" and entry.is_file():
+        return None, _register_python_file(candidate, seen)
+    return None, None
+
+
+def _consume_entries(
+    entries: Iterable[os.DirEntry], seen: set[Path], discovered: int
+) -> tuple[list[Path], list[Path], int]:
+    queued: list[Path] = []
+    sources: list[Path] = []
+    # quality: ignore[POT02] - every entry is charged to the hard discovery cap
+    for entry in entries:
+        discovered += 1
+        if discovered > MAX_DISCOVERED_PATHS:
+            raise AuditError(f"discovered path count exceeds {MAX_DISCOVERED_PATHS}")
+        child, source = _classify_entry(entry, seen)
+        if child is not None:
+            # quality: ignore[POT03] - one queued directory per capped entry
+            queued.append(child)
+        if source is not None:
+            # quality: ignore[POT03] - one source file per capped entry
+            sources.append(source)
+    return queued, sources, discovered
+
+
+def _scan_directory(
+    directory: Path, seen: set[Path], discovered: int
+) -> tuple[list[Path], list[Path], int]:
+    try:
+        with os.scandir(directory) as entries:
+            return _consume_entries(entries, seen, discovered)
+    except OSError as error:
+        raise AuditError(f"cannot inspect audit directory {directory}: {error}") from error
+
+
 def _iter_python_files(paths: Iterable[Path]) -> Iterator[Path]:
     supplied_paths = tuple(islice(paths, MAX_INPUT_PATHS + 1))
     if len(supplied_paths) > MAX_INPUT_PATHS:
@@ -486,13 +550,7 @@ def _iter_python_files(paths: Iterable[Path]) -> Iterator[Path]:
     discovered = 0
     # quality: ignore[POT02] - supplied_paths is rejected above MAX_INPUT_PATHS
     for supplied in supplied_paths:
-        path = supplied.resolve()
-        if not path.exists():
-            raise AuditError(f"audit path does not exist: {supplied}")
-        if not path.is_file() and not path.is_dir():
-            raise AuditError(f"audit path is not a regular file or directory: {supplied}")
-        if path.is_file() and path.suffix != ".py":
-            raise AuditError(f"audit path is not Python source: {supplied}")
+        path = _validated_input_path(supplied)
         if path.is_dir():
             # quality: ignore[POT03] - supplied directories are capped at MAX_INPUT_PATHS
             directories.append(path)
@@ -503,27 +561,10 @@ def _iter_python_files(paths: Iterable[Path]) -> Iterator[Path]:
     for _ in range(MAX_DIRECTORY_VISITS):
         if not directories:
             return
-        directory = directories.pop()
-        try:
-            with os.scandir(directory) as entries:
-                # quality: ignore[POT02] - every entry is charged to the hard discovery cap
-                for entry in entries:
-                    discovered += 1
-                    if discovered > MAX_DISCOVERED_PATHS:
-                        raise AuditError(
-                            f"discovered path count exceeds {MAX_DISCOVERED_PATHS}"
-                        )
-                    candidate = Path(entry.path)
-                    if entry.is_dir(follow_symlinks=False):
-                        if entry.name not in EXCLUDED_DIRECTORIES:
-                            # quality: ignore[POT03] - one queued directory per capped entry
-                            directories.append(candidate)
-                    elif candidate.suffix == ".py" and entry.is_file():
-                        registered = _register_python_file(candidate, seen)
-                        if registered is not None:
-                            yield registered
-        except OSError as error:
-            raise AuditError(f"cannot inspect audit directory {directory}: {error}") from error
+        queued, sources, discovered = _scan_directory(directories.pop(), seen, discovered)
+        # quality: ignore[POT03] - queued directories are capped by the discovery cap
+        directories.extend(queued)
+        yield from sources
     if directories:
         raise AuditError(f"directory traversal exceeds {MAX_DIRECTORY_VISITS} visits")
 
@@ -629,7 +670,7 @@ def _resolve_local_call(
     return None
 
 
-def _recursive_functions(functions: Sequence[FunctionInfo]) -> set[str]:
+def _call_graph(functions: Sequence[FunctionInfo]) -> dict[str, set[str]]:
     names: dict[str, list[str]] = defaultdict(list)
     # quality: ignore[POT02] - functions comes from an AST capped at MAX_AST_NODES
     for function in functions:
@@ -640,39 +681,51 @@ def _recursive_functions(functions: Sequence[FunctionInfo]) -> set[str]:
     for function in functions:
         # quality: ignore[POT02] - the helper enforces MAX_AST_NODES per function
         for node in _walk_without_nested_definitions(function.node):
-            if isinstance(node, ast.Call):
-                target = _resolve_local_call(node, function, names)
-                if target in graph:
-                    # quality: ignore[POT03] - graph edges are capped by source AST nodes
-                    graph[function.qualified_name].add(target)
+            target = (
+                _resolve_local_call(node, function, names)
+                if isinstance(node, ast.Call)
+                else None
+            )
+            if target in graph:
+                # quality: ignore[POT03] - graph edges are capped by source AST nodes
+                graph[function.qualified_name].add(target)
+    return graph
+
+
+def _origin_is_in_a_cycle(
+    graph: dict[str, set[str]], origin: str, total_steps: int
+) -> tuple[bool, int]:
+    pending = deque(graph[origin])
+    queued = set(pending)
+    for _ in range(MAX_AST_NODES):
+        if not pending:
+            return False, total_steps
+        total_steps += 1
+        if total_steps > MAX_CALL_GRAPH_STEPS:
+            raise AuditError(f"call graph traversal exceeds {MAX_CALL_GRAPH_STEPS} steps")
+        current = pending.popleft()
+        if current == origin:
+            return True, total_steps
+        # quality: ignore[POT02] - graph edges derive from the bounded source AST
+        for target in graph.get(current, ()):
+            if target not in queued:
+                # quality: ignore[POT03] - queued is capped by graph node count
+                queued.add(target)
+                # quality: ignore[POT03] - each graph node is enqueued at most once
+                pending.append(target)
+    raise AuditError(f"call graph depth exceeds {MAX_AST_NODES} functions")
+
+
+def _recursive_functions(functions: Sequence[FunctionInfo]) -> set[str]:
+    graph = _call_graph(functions)
     recursive: set[str] = set()
     total_steps = 0
     # quality: ignore[POT02] - graph size is capped and total work has a hard ceiling
     for origin in graph:
-        pending = deque(graph[origin])
-        queued = set(pending)
-        for _ in range(MAX_AST_NODES):
-            if not pending:
-                break
-            total_steps += 1
-            if total_steps > MAX_CALL_GRAPH_STEPS:
-                raise AuditError(
-                    f"call graph traversal exceeds {MAX_CALL_GRAPH_STEPS} steps"
-                )
-            current = pending.popleft()
-            if current == origin:
-                # quality: ignore[POT03] - recursive members cannot exceed graph nodes
-                recursive.add(origin)
-                break
-            # quality: ignore[POT02] - graph edges derive from the bounded source AST
-            for target in graph.get(current, ()):
-                if target not in queued:
-                    # quality: ignore[POT03] - queued is capped by graph node count
-                    queued.add(target)
-                    # quality: ignore[POT03] - each graph node is enqueued at most once
-                    pending.append(target)
-        else:
-            raise AuditError(f"call graph depth exceeds {MAX_AST_NODES} functions")
+        in_cycle, total_steps = _origin_is_in_a_cycle(graph, origin, total_steps)
+        if in_cycle:
+            # quality: ignore[POT03] - recursive members cannot exceed graph nodes
+            recursive.add(origin)
     return recursive
 
 
@@ -1426,6 +1479,94 @@ def _check_docstrings(
         _check_function_docstring(context, function)
 
 
+def _direct_bodies(statement: ast.stmt) -> list[ast.stmt]:
+    collected: list[ast.stmt] = []
+    for field in ("body", "orelse", "finalbody"):
+        # quality: ignore[POT08] - these optional AST statement fields are fixed by schema
+        value = getattr(statement, field, None)
+        if isinstance(value, list):
+            collected.extend(item for item in value if isinstance(item, ast.stmt))
+    return collected
+
+
+def _clause_body(clause: ast.AST) -> list[ast.stmt]:
+    # quality: ignore[POT08] - every except handler and match case carries a body
+    body = getattr(clause, "body", None)
+    if not isinstance(body, list):
+        return []
+    return [item for item in body if isinstance(item, ast.stmt)]
+
+
+def _clause_bodies(statement: ast.stmt, group_name: str) -> list[ast.stmt]:
+    # quality: ignore[POT08] - handler and case lists are fixed by the AST schema
+    group = getattr(statement, group_name, None)
+    if not isinstance(group, list):
+        return []
+    return [item for clause in group for item in _clause_body(clause)]
+
+
+def _nested_statements(statement: ast.stmt) -> list[ast.stmt]:
+    return [
+        *_direct_bodies(statement),
+        *_clause_bodies(statement, "handlers"),
+        *_clause_bodies(statement, "cases"),
+    ]
+
+
+def _child_depths(statement: ast.stmt, depth: int) -> list[tuple[ast.stmt, int]]:
+    if not isinstance(statement, NESTING_STATEMENTS):
+        return []
+    is_elif_chain = (
+        isinstance(statement, ast.If)
+        and len(statement.orelse) == 1
+        and isinstance(statement.orelse[0], ast.If)
+    )
+    if is_elif_chain and isinstance(statement, ast.If):
+        nested = [(child, depth + 1) for child in statement.body]
+        return [*nested, (statement.orelse[0], depth)]
+    return [(child, depth + 1) for child in _nested_statements(statement)]
+
+
+def _deepest_nesting(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> tuple[int, ast.stmt | None]:
+    pending: list[tuple[ast.stmt, int]] = [(child, 1) for child in node.body]
+    deepest = 0
+    marker: ast.stmt | None = None
+    for _ in range(MAX_AST_NODES):
+        if not pending:
+            return deepest, marker
+        statement, depth = pending.pop()
+        if depth > deepest:
+            deepest = depth
+            marker = statement
+        pending.extend(_child_depths(statement, depth))
+    raise AuditError(f"AST traversal exceeds {MAX_AST_NODES} nodes")
+
+
+def _check_nesting(context: ReviewContext, functions: Sequence[FunctionInfo]) -> None:
+    # quality: ignore[POT02] - functions comes from an AST capped at MAX_AST_NODES
+    for function in functions:
+        if _is_nested_function(function):
+            continue
+        depth, marker = _deepest_nesting(function.node)
+        if depth <= MAX_BLOCK_DEPTH or marker is None:
+            continue
+        context.report(
+            code="CS01",
+            severity="warning",
+            node=marker,
+            message=(
+                f"function {function.qualified_name} nests {depth} levels deep "
+                f"(limit: {MAX_BLOCK_DEPTH})"
+            ),
+            remedy=(
+                "Extract the inner block into a named function, or invert a "
+                "condition to return early and remove a level."
+            ),
+        )
+
+
 def _check_loops(context: ReviewContext) -> None:
     # quality: ignore[POT02] - context.tree was rejected above MAX_AST_NODES
     for node in ast.walk(context.tree):
@@ -1464,25 +1605,31 @@ def _check_loops(context: ReviewContext) -> None:
                 )
         else:
             continue
-        if bounded:
-            continue
-        # quality: ignore[POT02] - node belongs to the bounded context.tree AST
-        for child in ast.walk(node):
-            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
-                if child.func.attr in MUTATING_METHODS:
-                    context.report(
-                        code="POT03",
-                        severity="warning",
-                        node=child,
-                        message=(
-                            f"{child.func.attr} grows state inside a loop without "
-                            "a proven bound"
-                        ),
-                        remedy=(
-                            "Bound the loop and resource, stream results, or use "
-                            "a bounded container."
-                        ),
-                    )
+        if not bounded:
+            _report_unbounded_growth(context, node)
+
+
+def _report_unbounded_growth(context: ReviewContext, node: ast.AST) -> None:
+    mutations = [
+        child
+        for child in ast.walk(node)
+        if isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Attribute)
+        and child.func.attr in MUTATING_METHODS
+    ]
+    # quality: ignore[POT02] - mutations derive from the bounded context.tree AST
+    for child in mutations:
+        context.report(
+            code="POT03",
+            severity="warning",
+            node=child,
+            message=(
+                f"{child.func.attr} grows state inside a loop without a proven bound"
+            ),
+            remedy=(
+                "Bound the loop and resource, stream results, or use a bounded container."
+            ),
+        )
 
 
 def _check_exceptions_and_dynamic_code(context: ReviewContext) -> None:
@@ -1592,19 +1739,27 @@ def _if_chain_length(node: ast.If) -> int:
     return count
 
 
+def _is_self_field(target: ast.expr) -> bool:
+    return (
+        isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "self"
+    )
+
+
+def _assignment_targets(node: ast.AST) -> list[ast.expr]:
+    if isinstance(node, ast.Assign):
+        return list(node.targets)
+    return [node.target] if isinstance(node, ast.AnnAssign) else []
+
+
 def _class_assignments(node: ast.ClassDef) -> set[str]:
-    names: set[str] = set()
-    # quality: ignore[POT02] - node belongs to a tree capped at MAX_AST_NODES
-    for child in ast.walk(node):
-        if isinstance(child, (ast.Assign, ast.AnnAssign)):
-            targets = child.targets if isinstance(child, ast.Assign) else [child.target]
-            # quality: ignore[POT02] - assignment target count is capped by AST size
-            for target in targets:
-                if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
-                    if target.value.id == "self":
-                        # quality: ignore[POT03] - field names cannot exceed AST nodes
-                        names.add(target.attr)
-    return names
+    return {
+        target.attr
+        for child in ast.walk(node)
+        for target in _assignment_targets(child)
+        if _is_self_field(target) and isinstance(target, ast.Attribute)
+    }
 
 
 def _is_forwarder(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
@@ -1699,30 +1854,40 @@ def _check_classes_and_conditionals(context: ReviewContext) -> None:
             _check_class(context, node)
 
 
+def _first_unreachable(body: Sequence[ast.stmt]) -> ast.stmt | None:
+    terminated = False
+    # quality: ignore[POT02] - body statements are capped by MAX_AST_NODES
+    for statement in body:
+        if terminated:
+            return statement
+        terminated = isinstance(statement, TERMINATORS)
+    return None
+
+
+def _report_dead_code(context: ReviewContext, body: Sequence[ast.stmt]) -> None:
+    statement = _first_unreachable(body)
+    if statement is None:
+        return
+    context.report(
+        code="CS16",
+        severity="warning",
+        node=statement,
+        message="statement is unreachable after an unconditional terminator",
+        remedy=(
+            "Delete the dead statement after confirming no generated/"
+            "reflection entry point."
+        ),
+    )
+
+
 def _check_dead_code(context: ReviewContext) -> None:
     # quality: ignore[POT02] - context.tree was rejected above MAX_AST_NODES
     for parent in ast.walk(context.tree):
         for field in ("body", "orelse", "finalbody"):
             # quality: ignore[POT08] - these optional AST statement fields are fixed by schema
             body = getattr(parent, field, None)
-            if not isinstance(body, list):
-                continue
-            terminated = False
-            # quality: ignore[POT02] - body statements are capped by MAX_AST_NODES
-            for statement in body:
-                if terminated:
-                    context.report(
-                        code="CS16",
-                        severity="warning",
-                        node=statement,
-                        message="statement is unreachable after an unconditional terminator",
-                        remedy=(
-                            "Delete the dead statement after confirming no generated/"
-                            "reflection entry point."
-                        ),
-                    )
-                    break
-                terminated = isinstance(statement, TERMINATORS)
+            if isinstance(body, list):
+                _report_dead_code(context, body)
 
 
 def _check_data_clumps(
@@ -1857,6 +2022,7 @@ def _parse_module(source: str, path: Path, findings: list[Finding]) -> ast.Modul
 def _run_checks(context: ReviewContext, functions: Sequence[FunctionInfo]) -> None:
     _check_functions(context, functions)
     _check_docstrings(context, functions)
+    _check_nesting(context, functions)
     _check_loops(context)
     _check_exceptions_and_dynamic_code(context)
     _check_indirection_and_privacy(context)
