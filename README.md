@@ -134,17 +134,51 @@ The default CLI exit status fails on warnings or errors. Machine-readable output
 and a different threshold are available with `--format json` and
 `--fail-on error|warning|none`.
 
-Audit a project that documents in another convention with
-`--docstring-style google|rest`, or accept any supported convention with
-`--docstring-style any`, which disables `DOC02` while leaving `DOC01` and
-`DOC03` active.
-
 The Stop gate defaults to all findings. Set `RELIABLE_PYTHON_GATE=errors` before
 launching the host to continue only on errors, or `RELIABLE_PYTHON_GATE=off` to
 disable the completion gate while keeping skills and session guidance active.
-Set `RELIABLE_PYTHON_DOCSTYLE` to the same values as `--docstring-style` to
-change the convention the gate expects; an unrecognized value reports itself and
-falls back to `numpy`.
+
+### Choosing a docstring convention
+
+Declare it once in the project's `pyproject.toml`, so every session, teammate,
+and CI run agrees:
+
+```toml
+[tool.reliable-python]
+docstring-style = "google"   # numpy (default), google, rest, or any
+```
+
+`any` disables `DOC02` while leaving `DOC01` and `DOC03` active. The nearest
+`pyproject.toml` at or above the working directory is used.
+
+Precedence, highest first:
+
+| Source | Scope |
+|---|---|
+| `--docstring-style` | One command |
+| `RELIABLE_PYTHON_DOCSTYLE` | One shell session |
+| `[tool.reliable-python] docstring-style` | The project, committed to the repository |
+| built-in default (`numpy`) | Everything else |
+
+The setting drives both enforcement and guidance: the session policy injected
+into the agent names the resolved convention, so it never asks for NumPy while
+the checker accepts Google. Ask what is in effect with:
+
+```sh
+python3 skills/review-code-quality/scripts/audit_python.py --print-docstring-style
+```
+
+```text
+google (source: /path/to/project/pyproject.toml)
+```
+
+An unrecognized value is an explicit error rather than a silent fallback, except
+in the completion gate, which reports it and audits as `numpy` so a typo cannot
+quietly disable the check.
+
+Reading `pyproject.toml` uses `tomllib` and therefore needs Python 3.11 or
+newer. On 3.10 the flag and the environment variable still work, and the
+reported source says so.
 
 For a confirmed false positive, use one adjacent, reasoned suppression:
 

@@ -135,8 +135,23 @@ Args:
 ```
 
 Switching a whole project is a deliberate decision, not a side effect of one
-edit. Record it by auditing with `--docstring-style google|rest` and setting
-`RELIABLE_PYTHON_DOCSTYLE` for the session.
+edit. Record it in the project's `pyproject.toml`, so every session, teammate,
+and CI run agrees without anyone remembering a flag:
+
+```toml
+[tool.reliable-python]
+docstring-style = "google"   # numpy (default), google, rest, or any
+```
+
+Precedence is `--docstring-style` → `RELIABLE_PYTHON_DOCSTYLE` →
+`pyproject.toml` → `numpy`. Check what is actually in effect with:
+
+```sh
+python3 <skill-directory>/../review-code-quality/scripts/audit_python.py --print-docstring-style
+```
+
+The resolved convention is also stated at the end of the injected session
+policy, so it is visible without running anything.
 
 ## Checker Rules
 

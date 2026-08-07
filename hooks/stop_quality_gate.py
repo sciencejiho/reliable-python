@@ -13,7 +13,7 @@ import os
 import pathlib
 import subprocess
 import sys
-from typing import Any
+from typing import Any, Sequence
 
 
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -22,6 +22,7 @@ MAX_REPORTED_FINDINGS = 12
 VALID_GATE_LEVELS = frozenset({"all", "errors", "off"})
 VALID_DOCSTRING_STYLES = frozenset({"numpy", "google", "rest", "any"})
 DEFAULT_DOCSTRING_STYLE = "numpy"
+DOCSTYLE_ENV_VAR = "RELIABLE_PYTHON_DOCSTYLE"
 
 
 # quality: ignore[POT05] - module checks JSON, enum, process, timeout, and payload boundaries
@@ -39,17 +40,25 @@ def _emit(value: dict[str, Any]) -> int:
     return 0
 
 
-def _docstring_style() -> str:
-    requested = os.environ.get("RELIABLE_PYTHON_DOCSTYLE", DEFAULT_DOCSTRING_STYLE).lower()
-    return requested if requested in VALID_DOCSTRING_STYLES else DEFAULT_DOCSTRING_STYLE
+def _style_arguments() -> list[str]:
+    """Pin the style only to override an invalid environment variable.
+
+    Passing nothing lets the auditor resolve the convention itself, so a
+    project's ``pyproject.toml`` setting is honored instead of being masked by
+    an explicit flag.
+    """
+    requested = os.environ.get(DOCSTYLE_ENV_VAR)
+    if requested is not None and requested.lower() not in VALID_DOCSTRING_STYLES:
+        return ["--docstring-style", DEFAULT_DOCSTRING_STYLE]
+    return []
 
 
 def _style_notice() -> str:
-    requested = os.environ.get("RELIABLE_PYTHON_DOCSTYLE")
+    requested = os.environ.get(DOCSTYLE_ENV_VAR)
     if requested is None or requested.lower() in VALID_DOCSTRING_STYLES:
         return ""
     return (
-        f"Ignoring invalid RELIABLE_PYTHON_DOCSTYLE={requested!r}; "
+        f"Ignoring invalid {DOCSTYLE_ENV_VAR}={requested!r}; "
         f"auditing as {DEFAULT_DOCSTRING_STYLE}."
     )
 
@@ -62,7 +71,7 @@ def _with_notice(payload: dict[str, Any], notice: str) -> dict[str, Any]:
 
 
 def _run_audit(
-    cwd: pathlib.Path, docstring_style: str
+    cwd: pathlib.Path, style_arguments: Sequence[str]
 ) -> tuple[dict[str, Any] | None, str | None]:
     try:
         result = subprocess.run(
@@ -74,8 +83,7 @@ def _run_audit(
                 "json",
                 "--fail-on",
                 "none",
-                "--docstring-style",
-                docstring_style,
+                *style_arguments,
             ],
             cwd=cwd,
             check=False,
@@ -154,7 +162,7 @@ def main() -> int:
         return _emit({})
     notice = _style_notice()
     cwd = pathlib.Path(str(hook_input.get("cwd", pathlib.Path.cwd())))
-    payload, error = _run_audit(cwd, _docstring_style())
+    payload, error = _run_audit(cwd, _style_arguments())
     if error or payload is None:
         skipped = {"systemMessage": f"Reliable-code gate skipped: {error}"}
         return _emit(_with_notice(skipped, notice))
