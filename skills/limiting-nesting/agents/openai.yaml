@@ -1,0 +1,4 @@
+interface:
+  display_name: "Limit Python Nesting"
+  short_description: "Keep block depth at four levels or fewer"
+  default_prompt: "Use $limiting-nesting to flatten this deeply nested Python code."

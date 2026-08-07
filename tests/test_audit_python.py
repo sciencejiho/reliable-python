@@ -583,6 +583,118 @@ def public(alpha, beta):
         self.assertNotIn("POT04", codes(source))
 
 
+class NestingDepthTests(unittest.TestCase):
+    """Cover the CS01 block-nesting depth rule."""
+
+    def test_four_levels_are_allowed_and_five_are_reported(self) -> None:
+        at_limit = '''"""M."""
+
+
+def scan(rows):
+    """S."""
+    if not rows:
+        raise ValueError("rows")
+    for row in rows:
+        if row:
+            for cell in row:
+                print(cell)
+'''
+        self.assertNotIn("CS01", codes(at_limit))
+        too_deep = at_limit.replace(
+            "            for cell in row:\n                print(cell)\n",
+            "            for cell in row:\n                if cell:\n                    print(cell)\n",
+        )
+        self.assertIn("CS01", codes(too_deep))
+
+    def test_elif_ladders_count_as_one_level(self) -> None:
+        source = '''"""M."""
+
+
+def classify(value):
+    """C."""
+    if value is None:
+        raise ValueError("value")
+    if value == 1:
+        return "one"
+    elif value == 2:
+        return "two"
+    elif value == 3:
+        return "three"
+    elif value == 4:
+        return "four"
+    elif value == 5:
+        return "five"
+    return "many"
+'''
+        self.assertNotIn("CS01", codes(source))
+
+    def test_finding_anchors_to_the_deepest_statement(self) -> None:
+        source = '''"""M."""
+
+
+def scan(rows):
+    """S."""
+    if not rows:
+        raise ValueError("rows")
+    for row in rows:
+        if row:
+            for cell in row:
+                if cell:
+                    print(cell)
+'''
+        findings = [
+            item
+            for item in AUDITOR.analyze_source(source, pathlib.Path("sample.py"))
+            if item.code == "CS01"
+        ]
+        self.assertEqual(len(findings), 1)
+        self.assertIn("nests 5 levels", findings[0].message)
+        self.assertEqual(source.splitlines()[findings[0].line - 1].strip(), "print(cell)")
+
+    def test_except_and_match_clauses_add_a_level(self) -> None:
+        source = '''"""M."""
+
+
+def scan(rows):
+    """S."""
+    if not rows:
+        raise ValueError("rows")
+    for row in rows:
+        try:
+            print(row)
+        except ValueError:
+            for item in row:
+                if item:
+                    print(item)
+'''
+        self.assertIn("CS01", codes(source))
+
+    def test_depth_inside_a_closure_counts_toward_the_outer_function(self) -> None:
+        source = '''"""M."""
+
+
+def outer(rows):
+    """O."""
+    if not rows:
+        raise ValueError("rows")
+
+    def inner(row):
+        for cell in row:
+            if cell:
+                for part in cell:
+                    print(part)
+
+    return inner
+'''
+        findings = [
+            item
+            for item in AUDITOR.analyze_source(source, pathlib.Path("sample.py"))
+            if item.code == "CS01"
+        ]
+        self.assertEqual(len(findings), 1)
+        self.assertIn("outer", findings[0].message)
+
+
 class DocstringStyleResolutionTests(unittest.TestCase):
     """Cover precedence across the flag, the environment, and pyproject.toml."""
 
