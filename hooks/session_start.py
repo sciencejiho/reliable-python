@@ -12,10 +12,13 @@ broken hook must never block the user's session.
 
 import json
 import pathlib
+import subprocess
 import sys
 
 PLUGIN_ROOT = pathlib.Path(__file__).resolve().parent.parent
 ENTRY_SKILL = PLUGIN_ROOT / "skills" / "using-power-of-ten" / "SKILL.md"
+AUDITOR = PLUGIN_ROOT / "skills" / "review-code-quality" / "scripts" / "audit_python.py"
+MAX_RESOLVE_SECONDS = 10
 
 # The entry skill is injected into EVERY session, so it must stay small.
 # Tripping this ceiling means the skill has grown past its budget.
@@ -30,8 +33,57 @@ PREAMBLE = (
 )
 
 
-# quality: ignore[POT05] - this hook checks file I/O and the injected byte ceiling
+# quality: ignore[POT05] - this fail-open hook guards by returning sentinels, not raising
+def _resolved_convention() -> str:
+    """Ask the auditor which docstring convention this project actually uses.
+
+    The auditor owns the precedence rules, so shelling out keeps one source of
+    truth instead of duplicating resolution here.
+
+    Returns
+    -------
+    str
+        A Markdown line naming the active convention and where it came from, or
+        an empty string when resolution fails for any reason.
+    """
+    try:
+        result = subprocess.run(
+            [sys.executable, str(AUDITOR), "--print-docstring-style", "--format", "json"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=MAX_RESOLVE_SECONDS,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if result.returncode != 0:
+        return ""
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    label = payload.get("label")
+    source = payload.get("source")
+    if not isinstance(label, str) or not isinstance(source, str):
+        return ""
+    return (
+        f"\n\nActive documentation convention for this project: **{label}** "
+        f"(source: {source})."
+    )
+
+
 def main() -> int:
+    """Print the SessionStart payload carrying the shared policy text.
+
+    Returns
+    -------
+    int
+        Always ``0``. A hook that cannot read or size the entry skill reports
+        the problem on stderr and still exits successfully, because a broken
+        hook must never block the user's session.
+    """
     try:
         body = ENTRY_SKILL.read_text(encoding="utf-8")
     except OSError as exc:
@@ -47,7 +99,7 @@ def main() -> int:
         )
         return 0
 
-    context = PREAMBLE + body + "\n</RELIABLE_PYTHON_POLICY>"
+    context = PREAMBLE + body + _resolved_convention() + "\n</RELIABLE_PYTHON_POLICY>"
 
     # Claude Code and Codex both read this SessionStart output shape.
     json.dump(

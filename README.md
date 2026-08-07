@@ -3,9 +3,11 @@
 A shared Codex and Claude Code plugin for writing and reviewing Python with:
 
 - Gerard Holzmann's [Power of Ten](https://spinroot.com/gerard/pdf/P10.pdf)
-  rules, translated into an explicitly labeled Python profile; and
+  rules, translated into an explicitly labeled Python profile;
 - the 23 smells in the
-  [Refactoring.Guru catalog](https://refactoring.guru/ko/refactoring/smells).
+  [Refactoring.Guru catalog](https://refactoring.guru/ko/refactoring/smells); and
+- a documentation convention defaulting to
+  [NumPy-style docstrings](https://numpydoc.readthedocs.io/en/latest/format.html).
 
 The original rules target C and safety-critical development. This plugin does
 not certify Python code, prove safety, or claim to be an official NASA standard.
@@ -29,8 +31,30 @@ The checker recognizes high-signal cases including recursive call cycles,
 unbounded loops, resource growth inside those loops, functions over 60 lines,
 low defensive-check density, mutable defaults, broad swallowed exceptions,
 dynamic execution, deep attribute chains, long parameter lists, unreachable
-code, data clumps, duplicate function bodies, and several class-level smells.
+code, data clumps, duplicate function bodies, several class-level smells, and
+undocumented or inconsistently documented public definitions.
 Design-sensitive smells remain a semantic review responsibility.
+
+## Docstrings
+
+Public modules, classes, and functions default to NumPy style, which keeps a
+parameter's type, default, and constraints together instead of compressing them
+onto one line. Google and reST style are accepted for files that already use
+them; the `writing-docstrings` skill covers the templates and the choice.
+
+| ID | Fires when | numpydoc equivalent |
+|---|---|---|
+| `DOC01` | A public module, class, or function has no docstring | `GL08` |
+| `DOC02` | The sections identify a style other than the configured one | — |
+| `DOC03` | A parameter section exists but documents only some parameters | `PR01` |
+
+A summary-only docstring never triggers `DOC02`, because one line with no
+sections is valid in all three conventions. `DOC01` skips private names,
+dunders, nested functions, `@overload` and `...` stubs, property setters and
+deleters, `__init__.py`, and `test_*` functions in test modules.
+
+Because docstrings are required, the 60-line `POT04` limit measures code lines
+and excludes the docstring span.
 
 ## Install
 
@@ -66,6 +90,7 @@ hooks/
 skills/
   using-power-of-ten/       # entry policy and detailed references
   bounded-loops/            # focused Rule 2 workflow
+  writing-docstrings/       # NumPy-default documentation convention
   review-code-quality/      # audit workflow and static checker
 tests/
   test_audit_python.py
@@ -112,6 +137,48 @@ and a different threshold are available with `--format json` and
 The Stop gate defaults to all findings. Set `RELIABLE_PYTHON_GATE=errors` before
 launching the host to continue only on errors, or `RELIABLE_PYTHON_GATE=off` to
 disable the completion gate while keeping skills and session guidance active.
+
+### Choosing a docstring convention
+
+Declare it once in the project's `pyproject.toml`, so every session, teammate,
+and CI run agrees:
+
+```toml
+[tool.reliable-python]
+docstring-style = "google"   # numpy (default), google, rest, or any
+```
+
+`any` disables `DOC02` while leaving `DOC01` and `DOC03` active. The nearest
+`pyproject.toml` at or above the working directory is used.
+
+Precedence, highest first:
+
+| Source | Scope |
+|---|---|
+| `--docstring-style` | One command |
+| `RELIABLE_PYTHON_DOCSTYLE` | One shell session |
+| `[tool.reliable-python] docstring-style` | The project, committed to the repository |
+| built-in default (`numpy`) | Everything else |
+
+The setting drives both enforcement and guidance: the session policy injected
+into the agent names the resolved convention, so it never asks for NumPy while
+the checker accepts Google. Ask what is in effect with:
+
+```sh
+python3 skills/review-code-quality/scripts/audit_python.py --print-docstring-style
+```
+
+```text
+google (source: /path/to/project/pyproject.toml)
+```
+
+An unrecognized value is an explicit error rather than a silent fallback, except
+in the completion gate, which reports it and audits as `numpy` so a typo cannot
+quietly disable the check.
+
+Reading `pyproject.toml` uses `tomllib` and therefore needs Python 3.11 or
+newer. On 3.10 the flag and the environment variable still work, and the
+reported source says so.
 
 For a confirmed false positive, use one adjacent, reasoned suppression:
 

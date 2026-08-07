@@ -1,9 +1,16 @@
+"""Tests for the bundled quality auditor and the shared plugin hooks.
+
+The auditor is loaded from its script path rather than imported as a package,
+because it ships as a dependency-free file that both hosts execute directly.
+"""
+
 from __future__ import annotations
 
 import ast
 import importlib.util
 import itertools
 import json
+import os
 import pathlib
 import subprocess
 import sys
@@ -23,10 +30,24 @@ SPEC.loader.exec_module(AUDITOR)
 
 # quality: ignore[POT05] - this trivial test projection has no boundary invariant
 def codes(source: str) -> set[str]:
+    """Audit a source snippet and project the findings to their rule codes.
+
+    Parameters
+    ----------
+    source : str
+        Python source audited as ``sample.py`` with the NumPy default style.
+
+    Returns
+    -------
+    set of str
+        Distinct rule codes the auditor reported.
+    """
     return {item.code for item in AUDITOR.analyze_source(source, pathlib.Path("sample.py"))}
 
 
 class AuditPythonTests(unittest.TestCase):
+    """Cover the Power of Ten and code-smell rules in the bundled auditor."""
+
     def test_detects_direct_and_indirect_recursion(self) -> None:
         source = """
 def direct(value):
@@ -269,7 +290,7 @@ def new():
             target = pathlib.Path(directory) / "sample.py"
             target.write_bytes(b"abcdef")
             # quality: ignore[CS20] - regression test intentionally exercises the private seam
-            findings, bytes_read = AUDITOR._analyze_path(target, 3)
+            findings, bytes_read = AUDITOR._analyze_path(target, 3, "numpy")
         self.assertEqual(bytes_read, 4)
         self.assertIn("LIMIT001", {item.code for item in findings})
 
@@ -308,7 +329,402 @@ def new():
                     tuple(AUDITOR._iter_python_files([root]))
 
 
+class DocstringTests(unittest.TestCase):
+    """Cover the DOC01-DOC03 documentation convention rules."""
+
+    def test_flags_missing_docstrings_on_public_definitions_only(self) -> None:
+        source = '''"""Module."""
+
+
+def public(value):
+    return value
+
+
+def _private(value):
+    return value
+
+
+class Public:
+    pass
+
+
+class _Private:
+    pass
+'''
+        findings = AUDITOR.analyze_source(source, pathlib.Path("sample.py"))
+        subjects = [item.message for item in findings if item.code == "DOC01"]
+        self.assertEqual(len(subjects), 2)
+        self.assertTrue(any("function public" in item for item in subjects))
+        self.assertTrue(any("class Public" in item for item in subjects))
+
+    def test_exempts_nested_stub_dunder_and_decorated_definitions(self) -> None:
+        source = '''"""Module."""
+
+from typing import overload
+
+
+class Holder:
+    """Holder."""
+
+    def __init__(self, value):
+        self.value = value
+
+    @property
+    def item(self):
+        """Return the item."""
+        return self.value
+
+    @item.setter
+    def item(self, value):
+        self.value = value
+
+
+@overload
+def widen(value: int) -> int: ...
+
+
+def outer(value):
+    """Wrap an inner helper.
+
+    Parameters
+    ----------
+    value : int
+        Value to wrap.
+    """
+
+    def inner(item):
+        return item
+
+    return inner(value)
+'''
+        self.assertNotIn("DOC01", codes(source))
+
+    def test_methods_of_a_private_class_are_not_public_surface(self) -> None:
+        source = '''"""Module."""
+
+
+class _Private:
+    """Private."""
+
+    def public_method(self, value):
+        return value
+'''
+        self.assertNotIn("DOC01", codes(source))
+
+    def test_async_definitions_are_covered(self) -> None:
+        source = '"""Module."""\n\n\nasync def fetch(value):\n    return value\n'
+        self.assertIn("DOC01", codes(source))
+
+    def test_exempts_test_functions_in_test_modules_only(self) -> None:
+        source = '''"""Module."""
+
+
+def test_behavior():
+    assert True
+'''
+        in_test_module = {
+            item.code
+            for item in AUDITOR.analyze_source(source, pathlib.Path("test_sample.py"))
+        }
+        self.assertNotIn("DOC01", in_test_module)
+        self.assertIn("DOC01", codes(source))
+
+    def test_missing_module_docstring_is_reported_except_for_packages(self) -> None:
+        source = "VALUE = 1\n"
+        self.assertIn("DOC01", codes(source))
+        package = {
+            item.code
+            for item in AUDITOR.analyze_source(source, pathlib.Path("__init__.py"))
+        }
+        self.assertNotIn("DOC01", package)
+
+    def test_detects_each_supported_docstring_style(self) -> None:
+        numpy_text = "Summary.\n\nParameters\n----------\nvalue : int\n    A value.\n"
+        google_text = "Summary.\n\nArgs:\n    value (int): A value.\n"
+        rest_text = "Summary.\n\n:param int value: A value.\n"
+        self.assertEqual(AUDITOR.detect_docstring_style(numpy_text), "numpy")
+        self.assertEqual(AUDITOR.detect_docstring_style(google_text), "google")
+        self.assertEqual(AUDITOR.detect_docstring_style(rest_text), "rest")
+
+    def test_summary_only_docstring_has_no_detectable_style(self) -> None:
+        self.assertIsNone(AUDITOR.detect_docstring_style("Return the value."))
+        source = '''"""Module."""
+
+
+def public(value):
+    """Return the value unchanged."""
+    return value
+'''
+        self.assertNotIn("DOC02", codes(source))
+
+    def test_reports_a_competing_style_against_the_configured_default(self) -> None:
+        source = '''"""Module."""
+
+
+def public(value):
+    """Return the value.
+
+    Args:
+        value (int): A value.
+    """
+    return value
+'''
+        self.assertIn("DOC02", codes(source))
+        as_google = {
+            item.code
+            for item in AUDITOR.analyze_source(
+                source, pathlib.Path("sample.py"), "google"
+            )
+        }
+        self.assertNotIn("DOC02", as_google)
+        as_any = {
+            item.code
+            for item in AUDITOR.analyze_source(source, pathlib.Path("sample.py"), "any")
+        }
+        self.assertNotIn("DOC02", as_any)
+
+    def test_unknown_docstring_style_is_rejected(self) -> None:
+        with self.assertRaisesRegex(AUDITOR.AuditError, "unknown docstring style"):
+            AUDITOR.analyze_source('"""M."""\n', pathlib.Path("sample.py"), "epytext")
+
+    def test_partial_parameter_section_is_reported(self) -> None:
+        source = '''"""Module."""
+
+
+def public(alpha, beta, *rest, **options):
+    """Combine values.
+
+    Parameters
+    ----------
+    alpha : int
+        First value.
+
+    Returns
+    -------
+    int
+        The combination.
+    """
+    return alpha + beta + len(rest) + len(options)
+'''
+        findings = [item for item in AUDITOR.analyze_source(source, pathlib.Path("sample.py"))
+                    if item.code == "DOC03"]
+        self.assertEqual(len(findings), 1)
+        self.assertIn("beta", findings[0].message)
+        self.assertIn("rest", findings[0].message)
+        self.assertIn("options", findings[0].message)
+
+    def test_complete_parameter_sections_are_accepted_in_every_style(self) -> None:
+        numpy_source = '''"""Module."""
+
+
+def public(alpha, beta):
+    """Combine values.
+
+    Parameters
+    ----------
+    alpha, beta : int
+        Values to combine.
+    """
+    return alpha + beta
+'''
+        self.assertNotIn("DOC03", codes(numpy_source))
+        google_source = '''"""Module."""
+
+
+def public(alpha, beta):
+    """Combine values.
+
+    Args:
+        alpha (int): First value.
+        beta (int): Second value.
+    """
+    return alpha + beta
+'''
+        self.assertNotIn(
+            "DOC03",
+            {
+                item.code
+                for item in AUDITOR.analyze_source(
+                    google_source, pathlib.Path("sample.py"), "google"
+                )
+            },
+        )
+
+    def test_no_parameter_section_does_not_trigger_coverage(self) -> None:
+        source = '''"""Module."""
+
+
+def public(alpha, beta):
+    """Combine values.
+
+    Returns
+    -------
+    int
+        The combination.
+    """
+    return alpha + beta
+'''
+        self.assertNotIn("DOC03", codes(source))
+
+    def test_oversized_docstring_reports_an_explicit_limit(self) -> None:
+        body = "\n".join(str(index) for index in range(AUDITOR.MAX_DOCSTRING_LINES + 2))
+        source = f'"""{body}"""\n'
+        self.assertIn("LIMIT001", codes(source))
+
+    def test_docstring_lines_do_not_count_against_the_function_limit(self) -> None:
+        documentation = "\n".join(f"    line {index}." for index in range(40))
+        source = (
+            '"""Module."""\n\n\ndef public(value):\n'
+            '    """Summary.\n\n'
+            f"{documentation}\n"
+            '    """\n'
+            "    return value\n"
+        )
+        self.assertNotIn("POT04", codes(source))
+
+
+class DocstringStyleResolutionTests(unittest.TestCase):
+    """Cover precedence across the flag, the environment, and pyproject.toml."""
+
+    def _project(self, directory: str, body: str) -> pathlib.Path:
+        root = pathlib.Path(directory)
+        (root / "pyproject.toml").write_text(body, encoding="utf-8")
+        return root
+
+    def test_flag_outranks_environment_and_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._project(
+                directory, '[tool.reliable-python]\ndocstring-style = "rest"\n'
+            )
+            style, source = AUDITOR.resolve_docstring_style(
+                "google", {"RELIABLE_PYTHON_DOCSTYLE": "numpy"}, root
+            )
+        self.assertEqual(style, "google")
+        self.assertEqual(source, "--docstring-style")
+
+    def test_environment_outranks_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._project(
+                directory, '[tool.reliable-python]\ndocstring-style = "rest"\n'
+            )
+            style, source = AUDITOR.resolve_docstring_style(
+                None, {"RELIABLE_PYTHON_DOCSTYLE": "google"}, root
+            )
+        self.assertEqual(style, "google")
+        self.assertEqual(source, "RELIABLE_PYTHON_DOCSTYLE")
+
+    def test_configuration_outranks_the_built_in_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._project(
+                directory, '[tool.reliable-python]\ndocstring-style = "google"\n'
+            )
+            style, source = AUDITOR.resolve_docstring_style(None, {}, root)
+        self.assertEqual(style, "google")
+        self.assertIn("pyproject.toml", source)
+
+    def test_configuration_is_found_in_a_parent_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._project(
+                directory, '[tool.reliable-python]\ndocstring-style = "google"\n'
+            )
+            nested = root / "src" / "deep"
+            nested.mkdir(parents=True)
+            style, _ = AUDITOR.resolve_docstring_style(None, {}, nested)
+        self.assertEqual(style, "google")
+
+    def test_missing_or_unrelated_configuration_falls_back_to_numpy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            bare_style, bare_source = AUDITOR.resolve_docstring_style(None, {}, root)
+            self.assertEqual((bare_style, bare_source), ("numpy", "built-in default"))
+            self._project(directory, '[project]\nname = "sample"\n')
+            style, source = AUDITOR.resolve_docstring_style(None, {}, root)
+        self.assertEqual((style, source), ("numpy", "built-in default"))
+
+    def test_unknown_style_is_rejected_with_its_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._project(
+                directory, '[tool.reliable-python]\ndocstring-style = "epytext"\n'
+            )
+            with self.assertRaisesRegex(AUDITOR.AuditError, "epytext"):
+                AUDITOR.resolve_docstring_style(None, {}, root)
+        with self.assertRaisesRegex(AUDITOR.AuditError, "RELIABLE_PYTHON_DOCSTYLE"):
+            AUDITOR.resolve_docstring_style(
+                None, {"RELIABLE_PYTHON_DOCSTYLE": "epytext"}, pathlib.Path.cwd()
+            )
+
+    def test_malformed_configuration_is_an_explicit_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._project(directory, '[tool.reliable-python\nx = "y"\n')
+            with self.assertRaisesRegex(AUDITOR.AuditError, "cannot parse"):
+                AUDITOR.resolve_docstring_style(None, {}, root)
+
+    def test_print_docstring_style_reports_the_resolved_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._project(
+                directory, '[tool.reliable-python]\ndocstring-style = "google"\n'
+            )
+            result = subprocess.run(
+                [sys.executable, str(AUDITOR_PATH), "--print-docstring-style",
+                 "--format", "json"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+                env={key: value for key, value in os.environ.items()
+                     if key != "RELIABLE_PYTHON_DOCSTYLE"},
+            )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["style"], "google")
+        self.assertEqual(payload["label"], "Google")
+        self.assertIn("pyproject.toml", payload["source"])
+
+
 class HookIntegrationTests(unittest.TestCase):
+    """Cover the SessionStart and Stop hook contracts."""
+
+    def test_session_start_states_the_active_convention(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "pyproject.toml").write_text(
+                '[tool.reliable-python]\ndocstring-style = "google"\n', encoding="utf-8"
+            )
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "hooks" / "session_start.py")],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+                env={key: value for key, value in os.environ.items()
+                     if key != "RELIABLE_PYTHON_DOCSTYLE"},
+            )
+        context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Active documentation convention", context)
+        self.assertIn("**Google**", context)
+        self.assertNotIn("**NumPy-style**", context)
+
+    def test_stop_gate_honors_project_configuration(self) -> None:
+        google_source = (
+            '"""Module."""\n\n\ndef public(value):\n'
+            '    """Return the value.\n\n'
+            "    Args:\n"
+            "        value (int): A value.\n"
+            '    """\n'
+            "    return value\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            (root / "sample.py").write_text(google_source, encoding="utf-8")
+            hook_input = json.dumps({"cwd": str(root), "stop_hook_active": False})
+            blocked = self._run_stop_hook(hook_input, {})
+            self.assertIn("DOC02", blocked["reason"])
+            (root / "pyproject.toml").write_text(
+                '[tool.reliable-python]\ndocstring-style = "google"\n', encoding="utf-8"
+            )
+            configured = self._run_stop_hook(hook_input, {})
+            self.assertNotIn("DOC02", configured.get("reason", ""))
+
     def test_session_start_emits_shared_context(self) -> None:
         result = subprocess.run(
             [sys.executable, str(ROOT / "hooks" / "session_start.py")],
@@ -347,6 +763,44 @@ class HookIntegrationTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertEqual(payload["decision"], "block")
             self.assertIn("POT08", payload["reason"])
+
+    def test_stop_hook_honors_the_docstring_style_environment_variable(self) -> None:
+        google_source = (
+            '"""Module."""\n\n\ndef public(value):\n'
+            '    """Return the value.\n\n'
+            "    Args:\n"
+            "        value (int): A value.\n"
+            '    """\n'
+            "    return value\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            (root / "sample.py").write_text(google_source, encoding="utf-8")
+            hook_input = json.dumps({"cwd": str(root), "stop_hook_active": False})
+            blocked = self._run_stop_hook(hook_input, {})
+            self.assertEqual(blocked["decision"], "block")
+            self.assertIn("DOC02", blocked["reason"])
+            accepted = self._run_stop_hook(
+                hook_input, {"RELIABLE_PYTHON_DOCSTYLE": "google"}
+            )
+            self.assertNotIn("DOC02", accepted.get("reason", ""))
+            invalid = self._run_stop_hook(
+                hook_input, {"RELIABLE_PYTHON_DOCSTYLE": "epytext"}
+            )
+            self.assertEqual(invalid["decision"], "block")
+            self.assertIn("Ignoring invalid", invalid["systemMessage"])
+
+    def _run_stop_hook(self, hook_input: str, environment: dict[str, str]) -> dict:
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "hooks" / "stop_quality_gate.py")],
+            input=hook_input,
+            check=True,
+            capture_output=True,
+            text=True,
+            env={**os.environ, **environment},
+        )
+        return json.loads(result.stdout)
 
     def test_deletion_only_diff_is_attributed_to_the_enclosing_loop(self) -> None:
         baseline = """MAX_ITEMS = 10
@@ -410,6 +864,8 @@ def consume():
 
 
 class PackageConsistencyTests(unittest.TestCase):
+    """Keep the two host manifests and the local marketplace in agreement."""
+
     def test_host_manifests_and_marketplace_versions_match(self) -> None:
         claude = json.loads((ROOT / ".claude-plugin" / "plugin.json").read_text())
         codex = json.loads((ROOT / ".codex-plugin" / "plugin.json").read_text())
