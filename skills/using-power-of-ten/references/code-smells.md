@@ -11,7 +11,7 @@ name the concrete cost, and choose the smallest behavior-preserving remedy.
 
 | ID | Smell | Confirm when | Typical response and caution |
 |---|---|---|---|
-| CS01 | Long Method | One routine carries multiple phases, has deep nesting, or exceeds the project's readable size | Extract coherent operations or simplify data flow. Do not create tiny forwarding fragments that hide the algorithm. |
+| CS01 | Long Method | One routine carries multiple phases, has deep nesting, or exceeds the project's readable size | Extract coherent operations or simplify data flow. Do not create tiny forwarding fragments that hide the algorithm. The checker reports the nesting half mechanically at more than four levels; see `limiting-nesting`. |
 | CS02 | Large Class | A class owns unrelated responsibilities, many fields, or many independent change reasons | Split by responsibility or extract collaborators. A cohesive facade may legitimately be broad. |
 | CS03 | Primitive Obsession | Domain concepts repeatedly travel as raw strings, numbers, flags, or loosely related dictionaries | Introduce a value object, enum, or validated type when it centralizes real invariants; avoid wrappers with no behavior or safety benefit. |
 | CS04 | Long Parameter List | Callers repeatedly supply many arguments or argument order is easy to misuse | Preserve a whole object or introduce a parameter object. Do not hide unrelated dependencies in a grab-bag context. |
@@ -66,7 +66,7 @@ name the concrete cost, and choose the smallest behavior-preserving remedy.
 6. Prefer a focused refactor with characterization tests; do not mix a broad
    cleanup into an unrelated functional change.
 
-Cross-check overlaps instead of double-reporting them: POT04 often covers
-CS01, POT06 can expose CS09/CS20, POT08 can expose CS08, and POT09 often covers
+Cross-check overlaps instead of double-reporting them: POT04 covers the
+length half of CS01 while the checker reports its nesting half, POT06 can expose CS09/CS20, POT08 can expose CS08, and POT09 often covers
 CS22/CS23. Choose the ID that best explains the remedy and mention the overlap
 in the same finding.

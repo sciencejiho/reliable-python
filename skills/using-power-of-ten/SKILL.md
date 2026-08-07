@@ -25,7 +25,8 @@ structural change or review.
 ## Working rules
 
 1. Keep control flow simple. Do not use direct or indirect recursion. Do not
-   use exceptions for ordinary branching.
+   use exceptions for ordinary branching. Keep block nesting at four levels or
+   fewer; load `limiting-nesting` when a function goes deeper.
 2. Give every terminating loop a preset upper bound. Make an intentionally
    non-terminating service loop explicit and keep bounded work inside it.
 3. Bound runtime growth. Put ceilings on collections, queues, caches, input
