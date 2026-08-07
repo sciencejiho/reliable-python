@@ -50,11 +50,12 @@ structural change or review.
 ## Documentation convention
 
 This is a project convention, not one of Holzmann's ten rules. Document every
-public module, class, and function with a **NumPy-style** docstring; it carries
-per-parameter types, defaults, and constraints that a reader needs to enumerate
-a function's inputs. Google and reST style are acceptable when the file already
-uses them consistently. Load `writing-docstrings` before writing or restructuring
-a docstring.
+public module, class, and function in this project's configured convention,
+which defaults to **NumPy style**; it carries per-parameter types, defaults, and
+constraints that a reader needs to enumerate a function's inputs. Google and
+reST are supported alternates, set per project. The active convention is stated
+at the end of this policy. Load `writing-docstrings` before writing or
+restructuring a docstring.
 
 ## Workflow
 

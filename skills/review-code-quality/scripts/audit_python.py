@@ -22,7 +22,12 @@ from dataclasses import asdict, dataclass
 from itertools import islice
 from pathlib import Path
 from types import MappingProxyType
-from typing import Iterable, Iterator, Sequence
+from typing import Iterable, Iterator, Mapping, Sequence
+
+try:
+    import tomllib
+except ImportError:  # Python 3.10 has no tomllib; project config is unavailable.
+    tomllib = None
 
 
 EXCLUDED_DIRECTORIES = frozenset({
@@ -60,6 +65,12 @@ REFLECTION_BUILTINS = frozenset({"delattr", "getattr", "setattr"})
 MUTATING_METHODS = frozenset({"add", "append", "extend", "insert", "setdefault", "update"})
 TERMINATORS = (ast.Break, ast.Continue, ast.Raise, ast.Return)
 MAX_DOCSTRING_LINES = 2_000
+MAX_CONFIG_BYTES = 1_000_000
+MAX_CONFIG_SEARCH_DEPTH = 64
+CONFIG_FILENAME = "pyproject.toml"
+CONFIG_TABLE = "reliable-python"
+CONFIG_KEY = "docstring-style"
+DOCSTYLE_ENV_VAR = "RELIABLE_PYTHON_DOCSTYLE"
 DEFAULT_DOCSTRING_STYLE = "numpy"
 DOCSTRING_STYLES = ("numpy", "google", "rest", "any")
 STYLE_LABELS = MappingProxyType({"numpy": "NumPy", "google": "Google", "rest": "reST"})
@@ -836,6 +847,99 @@ def _meaningful_check_count(function: FunctionInfo) -> int:
             if name.startswith(("check", "ensure", "require", "validate")):
                 count += 1
     return count
+
+
+def _find_project_config(start: Path) -> Path | None:
+    current = start.resolve()
+    for _ in range(MAX_CONFIG_SEARCH_DEPTH):
+        candidate = current / CONFIG_FILENAME
+        if candidate.is_file():
+            return candidate
+        if current.parent == current:
+            return None
+        current = current.parent
+    return None
+
+
+def _read_config_table(path: Path) -> dict[str, object]:
+    try:
+        with path.open("rb") as handle:
+            payload = handle.read(MAX_CONFIG_BYTES + 1)
+    except OSError as error:
+        raise AuditError(f"cannot read {path}: {error}") from error
+    if len(payload) > MAX_CONFIG_BYTES:
+        raise AuditError(f"{path} exceeds {MAX_CONFIG_BYTES} bytes")
+    try:
+        document = tomllib.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise AuditError(f"cannot parse {path}: {error}") from error
+    tools = document.get("tool")
+    section = tools.get(CONFIG_TABLE) if isinstance(tools, dict) else None
+    return section if isinstance(section, dict) else {}
+
+
+def _validated_style(value: object, origin: str) -> str:
+    if not isinstance(value, str) or value.lower() not in DOCSTRING_STYLES:
+        supported = ", ".join(DOCSTRING_STYLES)
+        raise AuditError(
+            f"unknown docstring style {value!r} in {origin}; expected one of {supported}"
+        )
+    return value.lower()
+
+
+def _configured_style(start: Path) -> tuple[str, str]:
+    config_path = _find_project_config(start)
+    if config_path is None:
+        return DEFAULT_DOCSTRING_STYLE, "built-in default"
+    if tomllib is None:
+        return (
+            DEFAULT_DOCSTRING_STYLE,
+            f"built-in default; reading {CONFIG_FILENAME} requires Python 3.11 or newer",
+        )
+    value = _read_config_table(config_path).get(CONFIG_KEY)
+    if value is None:
+        return DEFAULT_DOCSTRING_STYLE, "built-in default"
+    origin = f"{config_path} [tool.{CONFIG_TABLE}] {CONFIG_KEY}"
+    return _validated_style(value, origin), str(config_path)
+
+
+def resolve_docstring_style(
+    requested: str | None, environment: Mapping[str, str], start: Path
+) -> tuple[str, str]:
+    """Resolve the documentation convention from all configuration sources.
+
+    Precedence is the command-line flag, then the environment variable, then
+    ``[tool.reliable-python] docstring-style`` in the nearest `pyproject.toml`
+    at or above `start`, then the built-in default.
+
+    Parameters
+    ----------
+    requested : str or None
+        Value supplied on the command line, or ``None`` when the flag was
+        omitted.
+    environment : mapping of str to str
+        Process environment consulted for `DOCSTYLE_ENV_VAR`.
+    start : Path
+        Directory the `pyproject.toml` search begins from, walking upward.
+
+    Returns
+    -------
+    tuple of (str, str)
+        The resolved style and a human-readable description of where it came
+        from, suitable for reporting to a user who is debugging configuration.
+
+    Raises
+    ------
+    AuditError
+        If any source supplies a style outside `DOCSTRING_STYLES`, or the
+        configuration file cannot be read or parsed.
+    """
+    if requested is not None:
+        return _validated_style(requested, "--docstring-style"), "--docstring-style"
+    from_environment = environment.get(DOCSTYLE_ENV_VAR)
+    if from_environment is not None:
+        return _validated_style(from_environment, DOCSTYLE_ENV_VAR), DOCSTYLE_ENV_VAR
+    return _configured_style(start)
 
 
 def _indent_width(line: str) -> int:
@@ -1951,38 +2055,35 @@ def _arguments(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--docstring-style",
         choices=DOCSTRING_STYLES,
-        default=DEFAULT_DOCSTRING_STYLE,
-        help="expected docstring convention; 'any' disables the DOC02 style check",
+        default=None,
+        help=(
+            "expected docstring convention; overrides "
+            f"{DOCSTYLE_ENV_VAR} and {CONFIG_FILENAME}. 'any' disables DOC02"
+        ),
+    )
+    parser.add_argument(
+        "--print-docstring-style",
+        action="store_true",
+        help="report the resolved docstring convention and its source, then exit",
     )
     args = parser.parse_args(argv)
     if args.git_diff and args.paths:
         parser.error("use --git-diff or explicit paths, not both")
-    if not args.git_diff and not args.paths:
+    if not args.print_docstring_style and not args.git_diff and not args.paths:
         parser.error("provide --git-diff or at least one path")
     return args
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """Run the audit from the command line.
+def _print_resolved_style(style: str, source: str, output_format: str) -> int:
+    if output_format == "json":
+        payload = {"style": style, "label": STYLE_LABELS.get(style, style), "source": source}
+        print(json.dumps(payload))
+    else:
+        print(f"{style} (source: {source})")
+    return 0
 
-    Parameters
-    ----------
-    argv : sequence of str or None, optional
-        Argument list without the program name. ``None`` reads `sys.argv`.
 
-    Returns
-    -------
-    int
-        ``0`` when no finding reaches the `--fail-on` threshold, ``1`` when one
-        does, and ``2`` when the audit could not be completed.
-    """
-    args = _arguments(sys.argv[1:] if argv is None else argv)
-    try:
-        selection = collect_git_diff(Path.cwd()) if args.git_diff else None
-        paths = selection.paths if selection else tuple(_iter_python_files(args.paths))
-    except AuditError as error:
-        print(f"quality audit: {error}", file=sys.stderr)
-        return 2
+def _audit_paths(paths: Sequence[Path], docstring_style: str) -> list[Finding]:
     findings: list[Finding] = []
     total_bytes = 0
     # quality: ignore[POT02] - paths is rejected above MAX_PYTHON_FILES
@@ -1996,9 +2097,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "Audit a narrower path set or split the scan into bounded scopes.",
             )
             break
-        path_findings, byte_count = _analyze_path(
-            path, remaining_bytes, args.docstring_style
-        )
+        path_findings, byte_count = _analyze_path(path, remaining_bytes, docstring_style)
         total_bytes += byte_count
         # quality: ignore[POT03] - findings is truncated explicitly at MAX_FINDINGS
         findings.extend(path_findings)
@@ -2013,6 +2112,44 @@ def main(argv: Sequence[str] | None = None) -> int:
             break
         if byte_count > remaining_bytes:
             break
+    return findings
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the audit from the command line.
+
+    The docstring convention is resolved before anything is audited, so a
+    misconfigured style fails fast with an explanation rather than silently
+    auditing against the wrong convention.
+
+    Parameters
+    ----------
+    argv : sequence of str or None, optional
+        Argument list without the program name. ``None`` reads `sys.argv`.
+
+    Returns
+    -------
+    int
+        ``0`` when no finding reaches the `--fail-on` threshold, ``1`` when one
+        does, and ``2`` when the audit could not be completed.
+    """
+    args = _arguments(sys.argv[1:] if argv is None else argv)
+    try:
+        style, source = resolve_docstring_style(
+            args.docstring_style, os.environ, Path.cwd()
+        )
+    except AuditError as error:
+        print(f"quality audit: {error}", file=sys.stderr)
+        return 2
+    if args.print_docstring_style:
+        return _print_resolved_style(style, source, args.format)
+    try:
+        selection = collect_git_diff(Path.cwd()) if args.git_diff else None
+        paths = selection.paths if selection else tuple(_iter_python_files(args.paths))
+    except AuditError as error:
+        print(f"quality audit: {error}", file=sys.stderr)
+        return 2
+    findings = _audit_paths(paths, style)
     if selection:
         findings = filter_changed_findings(findings, selection.changed_lines)
     findings.sort(key=lambda item: (item.path, item.line, item.code))

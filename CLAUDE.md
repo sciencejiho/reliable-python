@@ -66,8 +66,14 @@ Three layers, each with a different failure mode to respect.
 not the agent chooses to read a skill. It enforces `MAX_ENTRY_SKILL_BYTES =
 8_192` on that file. **Adding prose to the entry skill spends a budget charged
 to every session** — put detail in a focused skill and link to it. Current size
-is about 4.4 KB. This hook fails open: on any error it prints to stderr and
+is about 4.5 KB. This hook fails open: on any error it prints to stderr and
 exits 0.
+
+It also appends the resolved docstring convention by shelling out to
+`audit_python.py --print-docstring-style --format json`. That indirection is
+deliberate: the auditor owns the precedence rules, so guidance and enforcement
+cannot disagree. **If you add another configurable setting, resolve it in the
+auditor and read it back the same way** rather than parsing configuration twice.
 
 **2. Skills (`skills/*/SKILL.md`).** `using-power-of-ten` is the always-injected
 entry policy; the other three are loaded on demand and can be as long as they
@@ -119,8 +125,13 @@ which shapes how you write code here:
   not and needs a suppression. Comprehensions are not analyzed as loops, so
   prefer them for genuinely bounded projections.
 - **Functions cap at 60 code lines**, docstrings excluded from the count.
-- **Public definitions need NumPy-style docstrings** — the checker enforces this
-  on itself. See `skills/writing-docstrings/SKILL.md`.
+- **Public definitions need docstrings in the configured convention** — NumPy by
+  default, resolved from `--docstring-style`, then `RELIABLE_PYTHON_DOCSTYLE`,
+  then `[tool.reliable-python] docstring-style` in `pyproject.toml`. The checker
+  enforces this on itself. See `skills/writing-docstrings/SKILL.md`.
+- **`POT05` anchors its module-wide finding to the file's first function.**
+  Adding a function ahead of one that carries a `POT05` suppression moves the
+  anchor and re-opens the finding — move the comment with it.
 - **Suppressions require a specific rationale**:
   `# quality: ignore[POT02] - payload is rejected above MAX_GIT_OUTPUT_BYTES`.
   The bare form is itself a `QLT001` error. Every `MAX_*` constant exists so

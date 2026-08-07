@@ -583,8 +583,147 @@ def public(alpha, beta):
         self.assertNotIn("POT04", codes(source))
 
 
+class DocstringStyleResolutionTests(unittest.TestCase):
+    """Cover precedence across the flag, the environment, and pyproject.toml."""
+
+    def _project(self, directory: str, body: str) -> pathlib.Path:
+        root = pathlib.Path(directory)
+        (root / "pyproject.toml").write_text(body, encoding="utf-8")
+        return root
+
+    def test_flag_outranks_environment_and_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._project(
+                directory, '[tool.reliable-python]\ndocstring-style = "rest"\n'
+            )
+            style, source = AUDITOR.resolve_docstring_style(
+                "google", {"RELIABLE_PYTHON_DOCSTYLE": "numpy"}, root
+            )
+        self.assertEqual(style, "google")
+        self.assertEqual(source, "--docstring-style")
+
+    def test_environment_outranks_configuration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._project(
+                directory, '[tool.reliable-python]\ndocstring-style = "rest"\n'
+            )
+            style, source = AUDITOR.resolve_docstring_style(
+                None, {"RELIABLE_PYTHON_DOCSTYLE": "google"}, root
+            )
+        self.assertEqual(style, "google")
+        self.assertEqual(source, "RELIABLE_PYTHON_DOCSTYLE")
+
+    def test_configuration_outranks_the_built_in_default(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._project(
+                directory, '[tool.reliable-python]\ndocstring-style = "google"\n'
+            )
+            style, source = AUDITOR.resolve_docstring_style(None, {}, root)
+        self.assertEqual(style, "google")
+        self.assertIn("pyproject.toml", source)
+
+    def test_configuration_is_found_in_a_parent_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._project(
+                directory, '[tool.reliable-python]\ndocstring-style = "google"\n'
+            )
+            nested = root / "src" / "deep"
+            nested.mkdir(parents=True)
+            style, _ = AUDITOR.resolve_docstring_style(None, {}, nested)
+        self.assertEqual(style, "google")
+
+    def test_missing_or_unrelated_configuration_falls_back_to_numpy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            bare_style, bare_source = AUDITOR.resolve_docstring_style(None, {}, root)
+            self.assertEqual((bare_style, bare_source), ("numpy", "built-in default"))
+            self._project(directory, '[project]\nname = "sample"\n')
+            style, source = AUDITOR.resolve_docstring_style(None, {}, root)
+        self.assertEqual((style, source), ("numpy", "built-in default"))
+
+    def test_unknown_style_is_rejected_with_its_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._project(
+                directory, '[tool.reliable-python]\ndocstring-style = "epytext"\n'
+            )
+            with self.assertRaisesRegex(AUDITOR.AuditError, "epytext"):
+                AUDITOR.resolve_docstring_style(None, {}, root)
+        with self.assertRaisesRegex(AUDITOR.AuditError, "RELIABLE_PYTHON_DOCSTYLE"):
+            AUDITOR.resolve_docstring_style(
+                None, {"RELIABLE_PYTHON_DOCSTYLE": "epytext"}, pathlib.Path.cwd()
+            )
+
+    def test_malformed_configuration_is_an_explicit_error(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._project(directory, '[tool.reliable-python\nx = "y"\n')
+            with self.assertRaisesRegex(AUDITOR.AuditError, "cannot parse"):
+                AUDITOR.resolve_docstring_style(None, {}, root)
+
+    def test_print_docstring_style_reports_the_resolved_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = self._project(
+                directory, '[tool.reliable-python]\ndocstring-style = "google"\n'
+            )
+            result = subprocess.run(
+                [sys.executable, str(AUDITOR_PATH), "--print-docstring-style",
+                 "--format", "json"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+                env={key: value for key, value in os.environ.items()
+                     if key != "RELIABLE_PYTHON_DOCSTYLE"},
+            )
+        payload = json.loads(result.stdout)
+        self.assertEqual(payload["style"], "google")
+        self.assertEqual(payload["label"], "Google")
+        self.assertIn("pyproject.toml", payload["source"])
+
+
 class HookIntegrationTests(unittest.TestCase):
     """Cover the SessionStart and Stop hook contracts."""
+
+    def test_session_start_states_the_active_convention(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "pyproject.toml").write_text(
+                '[tool.reliable-python]\ndocstring-style = "google"\n', encoding="utf-8"
+            )
+            result = subprocess.run(
+                [sys.executable, str(ROOT / "hooks" / "session_start.py")],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+                env={key: value for key, value in os.environ.items()
+                     if key != "RELIABLE_PYTHON_DOCSTYLE"},
+            )
+        context = json.loads(result.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Active documentation convention", context)
+        self.assertIn("**Google**", context)
+        self.assertNotIn("**NumPy-style**", context)
+
+    def test_stop_gate_honors_project_configuration(self) -> None:
+        google_source = (
+            '"""Module."""\n\n\ndef public(value):\n'
+            '    """Return the value.\n\n'
+            "    Args:\n"
+            "        value (int): A value.\n"
+            '    """\n'
+            "    return value\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            (root / "sample.py").write_text(google_source, encoding="utf-8")
+            hook_input = json.dumps({"cwd": str(root), "stop_hook_active": False})
+            blocked = self._run_stop_hook(hook_input, {})
+            self.assertIn("DOC02", blocked["reason"])
+            (root / "pyproject.toml").write_text(
+                '[tool.reliable-python]\ndocstring-style = "google"\n', encoding="utf-8"
+            )
+            configured = self._run_stop_hook(hook_input, {})
+            self.assertNotIn("DOC02", configured.get("reason", ""))
 
     def test_session_start_emits_shared_context(self) -> None:
         result = subprocess.run(
