@@ -22,7 +22,12 @@ from dataclasses import asdict, dataclass
 from itertools import islice
 from pathlib import Path
 from types import MappingProxyType
-from typing import Iterable, Iterator, Sequence
+from typing import Iterable, Iterator, Mapping, Sequence
+
+try:
+    import tomllib
+except ImportError:  # Python 3.10 has no tomllib; project config is unavailable.
+    tomllib = None
 
 
 EXCLUDED_DIRECTORIES = frozenset({
@@ -59,6 +64,83 @@ DYNAMIC_BUILTINS = frozenset({"__import__", "compile", "eval", "exec"})
 REFLECTION_BUILTINS = frozenset({"delattr", "getattr", "setattr"})
 MUTATING_METHODS = frozenset({"add", "append", "extend", "insert", "setdefault", "update"})
 TERMINATORS = (ast.Break, ast.Continue, ast.Raise, ast.Return)
+MAX_BLOCK_DEPTH = 4
+NESTING_STATEMENTS = (
+    ast.AsyncFor,
+    ast.AsyncFunctionDef,
+    ast.AsyncWith,
+    ast.ClassDef,
+    ast.For,
+    ast.FunctionDef,
+    ast.If,
+    ast.Match,
+    ast.Try,
+    ast.While,
+    ast.With,
+)
+MAX_DOCSTRING_LINES = 2_000
+MAX_CONFIG_BYTES = 1_000_000
+MAX_CONFIG_SEARCH_DEPTH = 64
+CONFIG_FILENAME = "pyproject.toml"
+CONFIG_TABLE = "reliable-python"
+CONFIG_KEY = "docstring-style"
+DOCSTYLE_ENV_VAR = "RELIABLE_PYTHON_DOCSTYLE"
+DEFAULT_DOCSTRING_STYLE = "numpy"
+DOCSTRING_STYLES = ("numpy", "google", "rest", "any")
+STYLE_LABELS = MappingProxyType({"numpy": "NumPy", "google": "Google", "rest": "reST"})
+# Canonical numpydoc sections; see https://numpydoc.readthedocs.io/en/latest/format.html
+NUMPY_SECTION_NAMES = frozenset({
+    "Attributes",
+    "Examples",
+    "Methods",
+    "Notes",
+    "Other Parameters",
+    "Parameters",
+    "Raises",
+    "Receives",
+    "References",
+    "Returns",
+    "See Also",
+    "Warnings",
+    "Warns",
+    "Yields",
+})
+GOOGLE_SECTION_NAMES = frozenset({
+    "Args",
+    "Arguments",
+    "Attributes",
+    "Example",
+    "Examples",
+    "Keyword Args",
+    "Keyword Arguments",
+    "Methods",
+    "Note",
+    "Notes",
+    "Other Parameters",
+    "Raises",
+    "References",
+    "Returns",
+    "See Also",
+    "Todo",
+    "Warning",
+    "Warnings",
+    "Yields",
+})
+GOOGLE_PARAMETER_SECTIONS = frozenset({
+    "Args",
+    "Arguments",
+    "Keyword Args",
+    "Keyword Arguments",
+})
+DOCSTRING_EXEMPT_DECORATORS = frozenset({"deleter", "overload", "setter"})
+REST_FIELD_RE = re.compile(
+    r"^\s*:(?:param|parameter|arg|argument|key|keyword|type|returns?|rtype"
+    r"|raises?|except|exception|var|ivar|cvar|vartype)\b"
+)
+REST_PARAMETER_RE = re.compile(
+    r"^\s*:(?:param|parameter|arg|argument|key|keyword)\s+"
+    r"(?:[^\s:]+\s+)?(?P<name>\*{0,2}\w+)\s*:"
+)
 SUPPRESSION_TOKEN = "quality: ignore["
 SUPPRESSION_RE = re.compile(
     r"#\s*quality:\s*ignore\[([A-Z][A-Z0-9]+)\]\s*-\s*(\S.*)$"
@@ -73,6 +155,26 @@ class AuditError(ValueError):
 
 @dataclass(frozen=True)
 class Finding:
+    """One reported rule violation or code smell.
+
+    Attributes
+    ----------
+    code : str
+        Rule identifier, such as ``"POT02"``, ``"CS14"``, or ``"DOC01"``.
+    severity : str
+        One of ``"note"``, ``"warning"``, or ``"error"``.
+    path : str
+        File the finding was reported against.
+    line : int
+        First source line covered by the finding, 1-indexed.
+    end_line : int
+        Last source line covered, used to intersect against a diff.
+    message : str
+        What the code demonstrably does.
+    remedy : str
+        Smallest correction that resolves the finding.
+    """
+
     code: str
     severity: str
     path: str
@@ -102,6 +204,18 @@ def _record_limit(
 
 @dataclass(frozen=True)
 class FunctionInfo:
+    """A function or method located in the parsed module.
+
+    Attributes
+    ----------
+    qualified_name : str
+        Dotted path from module scope, such as ``"ReviewContext.report"``.
+    class_name : str or None
+        Dotted name of the enclosing class, or ``None`` for a plain function.
+    node : ast.FunctionDef or ast.AsyncFunctionDef
+        Definition node this record describes.
+    """
+
     qualified_name: str
     class_name: str | None
     node: ast.FunctionDef | ast.AsyncFunctionDef
@@ -109,6 +223,18 @@ class FunctionInfo:
 
 @dataclass(frozen=True)
 class DiffSelection:
+    """The changed Python scope discovered from a Git working tree.
+
+    Attributes
+    ----------
+    root : Path
+        Absolute repository root the paths are resolved against.
+    paths : tuple of Path
+        Changed Python files that exist on disk.
+    changed_lines : dict
+        Maps each path to the inclusive line ranges that the diff touched.
+    """
+
     root: Path
     paths: tuple[Path, ...]
     changed_lines: dict[Path, tuple[tuple[int, int], ...]]
@@ -140,11 +266,14 @@ class SourceLines(list[str]):
 
 @dataclass
 class ReviewContext:
+    """Per-file state shared by every check in one audit pass."""
+
     tree: ast.Module
     lines: SourceLines
     path: Path
     parents: dict[ast.AST, ast.AST]
     findings: list[Finding]
+    docstring_style: str = DEFAULT_DOCSTRING_STYLE
 
     def report(
         self,
@@ -155,6 +284,26 @@ class ReviewContext:
         message: str,
         remedy: str,
     ) -> None:
+        """Record one finding unless a suppression covers it.
+
+        Parameters
+        ----------
+        code : str
+            Rule identifier to report.
+        severity : str
+            One of ``"note"``, ``"warning"``, or ``"error"``.
+        node : ast.AST
+            Node whose line range the finding anchors to.
+        message : str
+            What the code demonstrably does.
+        remedy : str
+            Smallest correction that resolves the finding.
+
+        Raises
+        ------
+        AuditError
+            If the file already holds ``MAX_FINDINGS`` findings.
+        """
         # quality: ignore[POT08] - ast.AST line metadata is optional by contract
         line = int(getattr(node, "lineno", 1))
         if _is_suppressed(self.lines, line, code):
@@ -291,6 +440,27 @@ def _patch_ranges(root: Path, has_head: bool) -> dict[Path, list[tuple[int, int]
 
 
 def collect_git_diff(cwd: Path) -> DiffSelection:
+    """Determine which Python files and lines the working tree changed.
+
+    Tracked changes are read against ``HEAD`` when it exists, and against the
+    index otherwise. Untracked files count as changed in their entirety.
+
+    Parameters
+    ----------
+    cwd : Path
+        Directory inside the Git working tree to inspect.
+
+    Returns
+    -------
+    DiffSelection
+        Repository root, changed Python files, and their changed line ranges.
+
+    Raises
+    ------
+    AuditError
+        If `cwd` is outside a Git working tree, a Git command fails or times
+        out, or the change set exceeds ``MAX_PYTHON_FILES``.
+    """
     root = _git_root(cwd)
     has_head = _has_head(root)
     tracked, untracked = _changed_path_names(root, has_head)
@@ -321,6 +491,56 @@ def _register_python_file(candidate: Path, seen: set[Path]) -> Path | None:
     return resolved
 
 
+def _validated_input_path(supplied: Path) -> Path:
+    path = supplied.resolve()
+    if not path.exists():
+        raise AuditError(f"audit path does not exist: {supplied}")
+    if not path.is_file() and not path.is_dir():
+        raise AuditError(f"audit path is not a regular file or directory: {supplied}")
+    if path.is_file() and path.suffix != ".py":
+        raise AuditError(f"audit path is not Python source: {supplied}")
+    return path
+
+
+def _classify_entry(entry: os.DirEntry, seen: set[Path]) -> tuple[Path | None, Path | None]:
+    candidate = Path(entry.path)
+    if entry.is_dir(follow_symlinks=False):
+        return (None, None) if entry.name in EXCLUDED_DIRECTORIES else (candidate, None)
+    if candidate.suffix == ".py" and entry.is_file():
+        return None, _register_python_file(candidate, seen)
+    return None, None
+
+
+def _consume_entries(
+    entries: Iterable[os.DirEntry], seen: set[Path], discovered: int
+) -> tuple[list[Path], list[Path], int]:
+    queued: list[Path] = []
+    sources: list[Path] = []
+    # quality: ignore[POT02] - every entry is charged to the hard discovery cap
+    for entry in entries:
+        discovered += 1
+        if discovered > MAX_DISCOVERED_PATHS:
+            raise AuditError(f"discovered path count exceeds {MAX_DISCOVERED_PATHS}")
+        child, source = _classify_entry(entry, seen)
+        if child is not None:
+            # quality: ignore[POT03] - one queued directory per capped entry
+            queued.append(child)
+        if source is not None:
+            # quality: ignore[POT03] - one source file per capped entry
+            sources.append(source)
+    return queued, sources, discovered
+
+
+def _scan_directory(
+    directory: Path, seen: set[Path], discovered: int
+) -> tuple[list[Path], list[Path], int]:
+    try:
+        with os.scandir(directory) as entries:
+            return _consume_entries(entries, seen, discovered)
+    except OSError as error:
+        raise AuditError(f"cannot inspect audit directory {directory}: {error}") from error
+
+
 def _iter_python_files(paths: Iterable[Path]) -> Iterator[Path]:
     supplied_paths = tuple(islice(paths, MAX_INPUT_PATHS + 1))
     if len(supplied_paths) > MAX_INPUT_PATHS:
@@ -330,13 +550,7 @@ def _iter_python_files(paths: Iterable[Path]) -> Iterator[Path]:
     discovered = 0
     # quality: ignore[POT02] - supplied_paths is rejected above MAX_INPUT_PATHS
     for supplied in supplied_paths:
-        path = supplied.resolve()
-        if not path.exists():
-            raise AuditError(f"audit path does not exist: {supplied}")
-        if not path.is_file() and not path.is_dir():
-            raise AuditError(f"audit path is not a regular file or directory: {supplied}")
-        if path.is_file() and path.suffix != ".py":
-            raise AuditError(f"audit path is not Python source: {supplied}")
+        path = _validated_input_path(supplied)
         if path.is_dir():
             # quality: ignore[POT03] - supplied directories are capped at MAX_INPUT_PATHS
             directories.append(path)
@@ -347,27 +561,10 @@ def _iter_python_files(paths: Iterable[Path]) -> Iterator[Path]:
     for _ in range(MAX_DIRECTORY_VISITS):
         if not directories:
             return
-        directory = directories.pop()
-        try:
-            with os.scandir(directory) as entries:
-                # quality: ignore[POT02] - every entry is charged to the hard discovery cap
-                for entry in entries:
-                    discovered += 1
-                    if discovered > MAX_DISCOVERED_PATHS:
-                        raise AuditError(
-                            f"discovered path count exceeds {MAX_DISCOVERED_PATHS}"
-                        )
-                    candidate = Path(entry.path)
-                    if entry.is_dir(follow_symlinks=False):
-                        if entry.name not in EXCLUDED_DIRECTORIES:
-                            # quality: ignore[POT03] - one queued directory per capped entry
-                            directories.append(candidate)
-                    elif candidate.suffix == ".py" and entry.is_file():
-                        registered = _register_python_file(candidate, seen)
-                        if registered is not None:
-                            yield registered
-        except OSError as error:
-            raise AuditError(f"cannot inspect audit directory {directory}: {error}") from error
+        queued, sources, discovered = _scan_directory(directories.pop(), seen, discovered)
+        # quality: ignore[POT03] - queued directories are capped by the discovery cap
+        directories.extend(queued)
+        yield from sources
     if directories:
         raise AuditError(f"directory traversal exceeds {MAX_DIRECTORY_VISITS} visits")
 
@@ -473,7 +670,7 @@ def _resolve_local_call(
     return None
 
 
-def _recursive_functions(functions: Sequence[FunctionInfo]) -> set[str]:
+def _call_graph(functions: Sequence[FunctionInfo]) -> dict[str, set[str]]:
     names: dict[str, list[str]] = defaultdict(list)
     # quality: ignore[POT02] - functions comes from an AST capped at MAX_AST_NODES
     for function in functions:
@@ -484,39 +681,51 @@ def _recursive_functions(functions: Sequence[FunctionInfo]) -> set[str]:
     for function in functions:
         # quality: ignore[POT02] - the helper enforces MAX_AST_NODES per function
         for node in _walk_without_nested_definitions(function.node):
-            if isinstance(node, ast.Call):
-                target = _resolve_local_call(node, function, names)
-                if target in graph:
-                    # quality: ignore[POT03] - graph edges are capped by source AST nodes
-                    graph[function.qualified_name].add(target)
+            target = (
+                _resolve_local_call(node, function, names)
+                if isinstance(node, ast.Call)
+                else None
+            )
+            if target in graph:
+                # quality: ignore[POT03] - graph edges are capped by source AST nodes
+                graph[function.qualified_name].add(target)
+    return graph
+
+
+def _origin_is_in_a_cycle(
+    graph: dict[str, set[str]], origin: str, total_steps: int
+) -> tuple[bool, int]:
+    pending = deque(graph[origin])
+    queued = set(pending)
+    for _ in range(MAX_AST_NODES):
+        if not pending:
+            return False, total_steps
+        total_steps += 1
+        if total_steps > MAX_CALL_GRAPH_STEPS:
+            raise AuditError(f"call graph traversal exceeds {MAX_CALL_GRAPH_STEPS} steps")
+        current = pending.popleft()
+        if current == origin:
+            return True, total_steps
+        # quality: ignore[POT02] - graph edges derive from the bounded source AST
+        for target in graph.get(current, ()):
+            if target not in queued:
+                # quality: ignore[POT03] - queued is capped by graph node count
+                queued.add(target)
+                # quality: ignore[POT03] - each graph node is enqueued at most once
+                pending.append(target)
+    raise AuditError(f"call graph depth exceeds {MAX_AST_NODES} functions")
+
+
+def _recursive_functions(functions: Sequence[FunctionInfo]) -> set[str]:
+    graph = _call_graph(functions)
     recursive: set[str] = set()
     total_steps = 0
     # quality: ignore[POT02] - graph size is capped and total work has a hard ceiling
     for origin in graph:
-        pending = deque(graph[origin])
-        queued = set(pending)
-        for _ in range(MAX_AST_NODES):
-            if not pending:
-                break
-            total_steps += 1
-            if total_steps > MAX_CALL_GRAPH_STEPS:
-                raise AuditError(
-                    f"call graph traversal exceeds {MAX_CALL_GRAPH_STEPS} steps"
-                )
-            current = pending.popleft()
-            if current == origin:
-                # quality: ignore[POT03] - recursive members cannot exceed graph nodes
-                recursive.add(origin)
-                break
-            # quality: ignore[POT02] - graph edges derive from the bounded source AST
-            for target in graph.get(current, ()):
-                if target not in queued:
-                    # quality: ignore[POT03] - queued is capped by graph node count
-                    queued.add(target)
-                    # quality: ignore[POT03] - each graph node is enqueued at most once
-                    pending.append(target)
-        else:
-            raise AuditError(f"call graph depth exceeds {MAX_AST_NODES} functions")
+        in_cycle, total_steps = _origin_is_in_a_cycle(graph, origin, total_steps)
+        if in_cycle:
+            # quality: ignore[POT03] - recursive members cannot exceed graph nodes
+            recursive.add(origin)
     return recursive
 
 
@@ -693,6 +902,357 @@ def _meaningful_check_count(function: FunctionInfo) -> int:
     return count
 
 
+def _find_project_config(start: Path) -> Path | None:
+    current = start.resolve()
+    for _ in range(MAX_CONFIG_SEARCH_DEPTH):
+        candidate = current / CONFIG_FILENAME
+        if candidate.is_file():
+            return candidate
+        if current.parent == current:
+            return None
+        current = current.parent
+    return None
+
+
+def _read_config_table(path: Path) -> dict[str, object]:
+    try:
+        with path.open("rb") as handle:
+            payload = handle.read(MAX_CONFIG_BYTES + 1)
+    except OSError as error:
+        raise AuditError(f"cannot read {path}: {error}") from error
+    if len(payload) > MAX_CONFIG_BYTES:
+        raise AuditError(f"{path} exceeds {MAX_CONFIG_BYTES} bytes")
+    try:
+        document = tomllib.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise AuditError(f"cannot parse {path}: {error}") from error
+    tools = document.get("tool")
+    section = tools.get(CONFIG_TABLE) if isinstance(tools, dict) else None
+    return section if isinstance(section, dict) else {}
+
+
+def _validated_style(value: object, origin: str) -> str:
+    if not isinstance(value, str) or value.lower() not in DOCSTRING_STYLES:
+        supported = ", ".join(DOCSTRING_STYLES)
+        raise AuditError(
+            f"unknown docstring style {value!r} in {origin}; expected one of {supported}"
+        )
+    return value.lower()
+
+
+def _configured_style(start: Path) -> tuple[str, str]:
+    config_path = _find_project_config(start)
+    if config_path is None:
+        return DEFAULT_DOCSTRING_STYLE, "built-in default"
+    if tomllib is None:
+        return (
+            DEFAULT_DOCSTRING_STYLE,
+            f"built-in default; reading {CONFIG_FILENAME} requires Python 3.11 or newer",
+        )
+    value = _read_config_table(config_path).get(CONFIG_KEY)
+    if value is None:
+        return DEFAULT_DOCSTRING_STYLE, "built-in default"
+    origin = f"{config_path} [tool.{CONFIG_TABLE}] {CONFIG_KEY}"
+    return _validated_style(value, origin), str(config_path)
+
+
+def resolve_docstring_style(
+    requested: str | None, environment: Mapping[str, str], start: Path
+) -> tuple[str, str]:
+    """Resolve the documentation convention from all configuration sources.
+
+    Precedence is the command-line flag, then the environment variable, then
+    ``[tool.reliable-python] docstring-style`` in the nearest `pyproject.toml`
+    at or above `start`, then the built-in default.
+
+    Parameters
+    ----------
+    requested : str or None
+        Value supplied on the command line, or ``None`` when the flag was
+        omitted.
+    environment : mapping of str to str
+        Process environment consulted for `DOCSTYLE_ENV_VAR`.
+    start : Path
+        Directory the `pyproject.toml` search begins from, walking upward.
+
+    Returns
+    -------
+    tuple of (str, str)
+        The resolved style and a human-readable description of where it came
+        from, suitable for reporting to a user who is debugging configuration.
+
+    Raises
+    ------
+    AuditError
+        If any source supplies a style outside `DOCSTRING_STYLES`, or the
+        configuration file cannot be read or parsed.
+    """
+    if requested is not None:
+        return _validated_style(requested, "--docstring-style"), "--docstring-style"
+    from_environment = environment.get(DOCSTYLE_ENV_VAR)
+    if from_environment is not None:
+        return _validated_style(from_environment, DOCSTYLE_ENV_VAR), DOCSTYLE_ENV_VAR
+    return _configured_style(start)
+
+
+def _indent_width(line: str) -> int:
+    return len(line) - len(line.lstrip())
+
+
+def _docstring_text_lines(text: str) -> tuple[str, ...]:
+    lines = text.expandtabs(8).splitlines()
+    if len(lines) > MAX_DOCSTRING_LINES:
+        raise AuditError(f"docstring exceeds {MAX_DOCSTRING_LINES} lines")
+    return tuple(lines)
+
+
+def _is_numpy_underline(line: str) -> bool:
+    stripped = line.strip()
+    return bool(stripped) and set(stripped) == {"-"}
+
+
+def _is_google_heading(current: str, following: str) -> bool:
+    stripped = current.strip()
+    if not stripped.endswith(":") or stripped[:-1] not in GOOGLE_SECTION_NAMES:
+        return False
+    if not following.strip():
+        return False
+    return _indent_width(following) > _indent_width(current)
+
+
+def _numpy_section_hits(lines: Sequence[str]) -> int:
+    return sum(
+        1
+        for index in range(len(lines) - 1)
+        if lines[index].strip() in NUMPY_SECTION_NAMES
+        and _is_numpy_underline(lines[index + 1])
+    )
+
+
+def _google_section_hits(lines: Sequence[str]) -> int:
+    return sum(
+        1
+        for index in range(len(lines) - 1)
+        if _is_google_heading(lines[index], lines[index + 1])
+    )
+
+
+def _rest_field_hits(lines: Sequence[str]) -> int:
+    return sum(1 for line in lines if REST_FIELD_RE.match(line))
+
+
+def detect_docstring_style(text: str) -> str | None:
+    """Identify the section convention a docstring positively demonstrates.
+
+    A summary-only docstring carries no section markers and is valid in every
+    supported convention, so it is reported as undetermined rather than as a
+    violation.
+
+    Parameters
+    ----------
+    text : str
+        Raw docstring body, without the surrounding quotes.
+
+    Returns
+    -------
+    str or None
+        ``"numpy"``, ``"google"``, or ``"rest"`` when exactly one convention
+        supplies the most evidence, and ``None`` when the docstring has no
+        sections or two conventions tie.
+
+    Raises
+    ------
+    AuditError
+        If the docstring exceeds ``MAX_DOCSTRING_LINES`` lines.
+    """
+    lines = _docstring_text_lines(text)
+    scores = {
+        "numpy": _numpy_section_hits(lines),
+        "google": _google_section_hits(lines),
+        "rest": _rest_field_hits(lines),
+    }
+    best = max(scores.values())
+    if best == 0:
+        return None
+    leaders = [name for name, score in scores.items() if score == best]
+    return leaders[0] if len(leaders) == 1 else None
+
+
+def _numpy_section_body(lines: Sequence[str], name: str) -> tuple[str, ...]:
+    start = -1
+    # quality: ignore[POT02] - docstring lines are capped at MAX_DOCSTRING_LINES
+    for index in range(len(lines) - 1):
+        heading = lines[index].strip()
+        if not _is_numpy_underline(lines[index + 1]):
+            continue
+        if start < 0 and heading == name:
+            start = index + 2
+        elif start >= 0 and heading in NUMPY_SECTION_NAMES:
+            return tuple(lines[start:index])
+    return tuple(lines[start:]) if start >= 0 else ()
+
+
+def _google_section_body(lines: Sequence[str], names: frozenset[str]) -> tuple[str, ...]:
+    start = -1
+    heading_indent = 0
+    # quality: ignore[POT02] - docstring lines are capped at MAX_DOCSTRING_LINES
+    for index in range(len(lines)):
+        stripped = lines[index].strip()
+        if not stripped.endswith(":") or stripped[:-1] not in GOOGLE_SECTION_NAMES:
+            continue
+        if start < 0 and stripped[:-1] in names:
+            start = index + 1
+            heading_indent = _indent_width(lines[index])
+        elif start >= 0 and _indent_width(lines[index]) <= heading_indent:
+            return tuple(lines[start:index])
+    return tuple(lines[start:]) if start >= 0 else ()
+
+
+def _split_parameter_names(head: str) -> set[str]:
+    candidates = [part.strip().lstrip("*") for part in head.split(",")]
+    return {name for name in candidates if name.isidentifier()}
+
+
+def _entry_heads(body: Sequence[str], separator: str) -> list[str]:
+    entries = [line for line in body if line.strip()]
+    if not entries:
+        return []
+    base = min(_indent_width(line) for line in entries)
+    return [
+        line.split(separator)[0].strip()
+        for line in entries
+        if _indent_width(line) == base and separator in line
+    ]
+
+
+def _numpy_documented_parameters(lines: Sequence[str]) -> set[str]:
+    body = _numpy_section_body(lines, "Parameters")
+    entries = [line for line in body if line.strip()]
+    if not entries:
+        return set()
+    base = min(_indent_width(line) for line in entries)
+    heads = [
+        line.split(" :")[0].strip() if " :" in line else line.strip()
+        for line in entries
+        if _indent_width(line) == base
+    ]
+    return {name for head in heads for name in _split_parameter_names(head)}
+
+
+def _google_documented_parameters(lines: Sequence[str]) -> set[str]:
+    body = _google_section_body(lines, GOOGLE_PARAMETER_SECTIONS)
+    heads = [head.split("(")[0].strip() for head in _entry_heads(body, ":")]
+    return {name for head in heads for name in _split_parameter_names(head)}
+
+
+def _rest_documented_parameters(lines: Sequence[str]) -> set[str]:
+    matches = [REST_PARAMETER_RE.match(line) for line in lines]
+    return {
+        match.group("name").lstrip("*") for match in matches if match is not None
+    }
+
+
+def _documented_parameters(text: str, style: str) -> set[str]:
+    lines = _docstring_text_lines(text)
+    if style == "numpy":
+        return _numpy_documented_parameters(lines)
+    if style == "google":
+        return _google_documented_parameters(lines)
+    if style == "rest":
+        return _rest_documented_parameters(lines)
+    return set()
+
+
+def _signature_parameter_names(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> tuple[str, ...]:
+    arguments = node.args
+    named = [*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs]
+    extras = [item for item in (arguments.vararg, arguments.kwarg) if item is not None]
+    return tuple(
+        item.arg for item in [*named, *extras] if item.arg not in {"self", "cls"}
+    )
+
+
+def _is_docstring_statement(statement: ast.stmt) -> bool:
+    return (
+        isinstance(statement, ast.Expr)
+        and isinstance(statement.value, ast.Constant)
+        and isinstance(statement.value.value, str)
+    )
+
+
+def _docstring_span(node: ast.AST) -> int:
+    # quality: ignore[POT08] - only definition nodes carry an optional body field
+    body = getattr(node, "body", None)
+    if not isinstance(body, list) or not body:
+        return 0
+    first = body[0]
+    if not isinstance(first, ast.stmt) or not _is_docstring_statement(first):
+        return 0
+    return _node_end(first) - first.lineno + 1
+
+
+def _docstring_anchor(node: ast.AST) -> ast.AST:
+    # quality: ignore[POT08] - only definition nodes carry an optional body field
+    body = getattr(node, "body", None)
+    if isinstance(body, list) and body and _is_docstring_statement(body[0]):
+        return body[0]
+    return node
+
+
+def _is_test_module(path: Path) -> bool:
+    name = path.name
+    return name.startswith("test_") or name.endswith("_test.py")
+
+
+def _is_nested_function(function: FunctionInfo) -> bool:
+    depth = function.qualified_name.count(".") + 1
+    class_depth = function.class_name.count(".") + 1 if function.class_name else 0
+    return depth != class_depth + 1
+
+
+def _is_stub_body(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    body = [item for item in node.body if not _is_docstring_statement(item)]
+    if len(body) != 1:
+        return False
+    only = body[0]
+    if isinstance(only, ast.Pass):
+        return True
+    return (
+        isinstance(only, ast.Expr)
+        and isinstance(only.value, ast.Constant)
+        and only.value.value is Ellipsis
+    )
+
+
+def _has_exempt_decorator(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    names = [
+        _call_name(item.func) if isinstance(item, ast.Call) else _call_name(item)
+        for item in node.decorator_list
+    ]
+    return any(name.split(".")[-1] in DOCSTRING_EXEMPT_DECORATORS for name in names)
+
+
+def _is_public_scope(function: FunctionInfo) -> bool:
+    owner = function.class_name
+    if owner is None:
+        return True
+    return not any(part.startswith("_") for part in owner.split("."))
+
+
+def _requires_docstring(path: Path, function: FunctionInfo) -> bool:
+    node = function.node
+    name = node.name
+    if name.startswith("_") or not _is_public_scope(function):
+        return False
+    if _is_nested_function(function) or _is_stub_body(node):
+        return False
+    if _has_exempt_decorator(node):
+        return False
+    return not (_is_test_module(path) and name.startswith("test"))
+
+
 def _invalid_suppressions(lines: SourceLines, path: Path) -> list[Finding]:
     findings: list[Finding] = []
     numbers = sorted(lines.invalid_suppressions)
@@ -770,13 +1330,16 @@ def _check_functions(
                 message=f"recursive call cycle includes {function.qualified_name}",
                 remedy="Replace recursion with an explicitly bounded worklist.",
             )
-        span = _node_end(node) - node.lineno + 1
+        span = _node_end(node) - node.lineno + 1 - _docstring_span(node)
         if span > 60:
             context.report(
                 code="POT04",
                 severity="error",
                 node=node,
-                message=f"function {function.qualified_name} spans {span} lines (limit: 60)",
+                message=(
+                    f"function {function.qualified_name} spans {span} code lines "
+                    "excluding its docstring (limit: 60)"
+                ),
                 remedy="Extract coherent units without compressing statements.",
             )
         _check_function_signature(context, function)
@@ -798,6 +1361,210 @@ def _check_functions(
                     "functions need none."
                 ),
             )
+
+
+def _report_missing_docstring(
+    context: ReviewContext, node: ast.AST, subject: str
+) -> None:
+    label = STYLE_LABELS.get(context.docstring_style, "NumPy")
+    context.report(
+        code="DOC01",
+        severity="warning",
+        node=node,
+        message=f"public {subject} has no docstring",
+        remedy=(
+            f"Add a {label}-style docstring, or make the name private if it is "
+            "not part of the public surface."
+        ),
+    )
+
+
+def _report_docstring_style(
+    context: ReviewContext, text: str, node: ast.AST, subject: str
+) -> None:
+    if context.docstring_style == "any":
+        return
+    detected = detect_docstring_style(text)
+    if detected is None or detected == context.docstring_style:
+        return
+    expected = STYLE_LABELS[context.docstring_style]
+    context.report(
+        code="DOC02",
+        severity="warning",
+        node=node,
+        message=(
+            f"docstring for {subject} uses {STYLE_LABELS[detected]} sections; "
+            f"this project documents in {expected} style"
+        ),
+        remedy=(
+            f"Rewrite the sections in {expected} form, or audit with "
+            f"--docstring-style {detected} if the project standard changed."
+        ),
+    )
+
+
+def _report_parameter_gaps(
+    context: ReviewContext, text: str, node: ast.AST, function: FunctionInfo
+) -> None:
+    detected = detect_docstring_style(text)
+    if detected is None:
+        return
+    documented = _documented_parameters(text, detected)
+    if not documented:
+        return
+    expected = _signature_parameter_names(function.node)
+    missing = [name for name in expected if name not in documented]
+    if not missing:
+        return
+    context.report(
+        code="DOC03",
+        severity="warning",
+        node=node,
+        message=(
+            f"docstring for {function.qualified_name} documents "
+            f"{len(expected) - len(missing)} of {len(expected)} parameters; "
+            f"missing {', '.join(missing)}"
+        ),
+        remedy=(
+            "Document every parameter, or drop the parameter section so the "
+            "docstring does not look complete when it is not."
+        ),
+    )
+
+
+def _check_function_docstring(context: ReviewContext, function: FunctionInfo) -> None:
+    node = function.node
+    if not _requires_docstring(context.path, function):
+        return
+    text = ast.get_docstring(node, clean=False)
+    if text is None or not text.strip():
+        _report_missing_docstring(context, node, f"function {function.qualified_name}")
+        return
+    anchor = _docstring_anchor(node)
+    _report_docstring_style(context, text, anchor, f"function {function.qualified_name}")
+    _report_parameter_gaps(context, text, anchor, function)
+
+
+def _check_module_docstring(context: ReviewContext) -> None:
+    if context.path.name == "__init__.py" or not context.tree.body:
+        return
+    text = ast.get_docstring(context.tree, clean=False)
+    subject = f"module {context.path.name}"
+    if text is None or not text.strip():
+        _report_missing_docstring(context, context.tree.body[0], subject)
+        return
+    _report_docstring_style(context, text, _docstring_anchor(context.tree), subject)
+
+
+def _check_class_docstrings(context: ReviewContext) -> None:
+    # quality: ignore[POT02] - context.tree was rejected above MAX_AST_NODES
+    for node in ast.walk(context.tree):
+        if not isinstance(node, ast.ClassDef) or node.name.startswith("_"):
+            continue
+        text = ast.get_docstring(node, clean=False)
+        subject = f"class {node.name}"
+        if text is None or not text.strip():
+            _report_missing_docstring(context, node, subject)
+            continue
+        _report_docstring_style(context, text, _docstring_anchor(node), subject)
+
+
+def _check_docstrings(
+    context: ReviewContext, functions: Sequence[FunctionInfo]
+) -> None:
+    _check_module_docstring(context)
+    _check_class_docstrings(context)
+    # quality: ignore[POT02] - functions comes from an AST capped at MAX_AST_NODES
+    for function in functions:
+        _check_function_docstring(context, function)
+
+
+def _direct_bodies(statement: ast.stmt) -> list[ast.stmt]:
+    collected: list[ast.stmt] = []
+    for field in ("body", "orelse", "finalbody"):
+        # quality: ignore[POT08] - these optional AST statement fields are fixed by schema
+        value = getattr(statement, field, None)
+        if isinstance(value, list):
+            collected.extend(item for item in value if isinstance(item, ast.stmt))
+    return collected
+
+
+def _clause_body(clause: ast.AST) -> list[ast.stmt]:
+    # quality: ignore[POT08] - every except handler and match case carries a body
+    body = getattr(clause, "body", None)
+    if not isinstance(body, list):
+        return []
+    return [item for item in body if isinstance(item, ast.stmt)]
+
+
+def _clause_bodies(statement: ast.stmt, group_name: str) -> list[ast.stmt]:
+    # quality: ignore[POT08] - handler and case lists are fixed by the AST schema
+    group = getattr(statement, group_name, None)
+    if not isinstance(group, list):
+        return []
+    return [item for clause in group for item in _clause_body(clause)]
+
+
+def _nested_statements(statement: ast.stmt) -> list[ast.stmt]:
+    return [
+        *_direct_bodies(statement),
+        *_clause_bodies(statement, "handlers"),
+        *_clause_bodies(statement, "cases"),
+    ]
+
+
+def _child_depths(statement: ast.stmt, depth: int) -> list[tuple[ast.stmt, int]]:
+    if not isinstance(statement, NESTING_STATEMENTS):
+        return []
+    is_elif_chain = (
+        isinstance(statement, ast.If)
+        and len(statement.orelse) == 1
+        and isinstance(statement.orelse[0], ast.If)
+    )
+    if is_elif_chain and isinstance(statement, ast.If):
+        nested = [(child, depth + 1) for child in statement.body]
+        return [*nested, (statement.orelse[0], depth)]
+    return [(child, depth + 1) for child in _nested_statements(statement)]
+
+
+def _deepest_nesting(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> tuple[int, ast.stmt | None]:
+    pending: list[tuple[ast.stmt, int]] = [(child, 1) for child in node.body]
+    deepest = 0
+    marker: ast.stmt | None = None
+    for _ in range(MAX_AST_NODES):
+        if not pending:
+            return deepest, marker
+        statement, depth = pending.pop()
+        if depth > deepest:
+            deepest = depth
+            marker = statement
+        pending.extend(_child_depths(statement, depth))
+    raise AuditError(f"AST traversal exceeds {MAX_AST_NODES} nodes")
+
+
+def _check_nesting(context: ReviewContext, functions: Sequence[FunctionInfo]) -> None:
+    # quality: ignore[POT02] - functions comes from an AST capped at MAX_AST_NODES
+    for function in functions:
+        if _is_nested_function(function):
+            continue
+        depth, marker = _deepest_nesting(function.node)
+        if depth <= MAX_BLOCK_DEPTH or marker is None:
+            continue
+        context.report(
+            code="CS01",
+            severity="warning",
+            node=marker,
+            message=(
+                f"function {function.qualified_name} nests {depth} levels deep "
+                f"(limit: {MAX_BLOCK_DEPTH})"
+            ),
+            remedy=(
+                "Extract the inner block into a named function, or invert a "
+                "condition to return early and remove a level."
+            ),
+        )
 
 
 def _check_loops(context: ReviewContext) -> None:
@@ -838,25 +1605,31 @@ def _check_loops(context: ReviewContext) -> None:
                 )
         else:
             continue
-        if bounded:
-            continue
-        # quality: ignore[POT02] - node belongs to the bounded context.tree AST
-        for child in ast.walk(node):
-            if isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
-                if child.func.attr in MUTATING_METHODS:
-                    context.report(
-                        code="POT03",
-                        severity="warning",
-                        node=child,
-                        message=(
-                            f"{child.func.attr} grows state inside a loop without "
-                            "a proven bound"
-                        ),
-                        remedy=(
-                            "Bound the loop and resource, stream results, or use "
-                            "a bounded container."
-                        ),
-                    )
+        if not bounded:
+            _report_unbounded_growth(context, node)
+
+
+def _report_unbounded_growth(context: ReviewContext, node: ast.AST) -> None:
+    mutations = [
+        child
+        for child in ast.walk(node)
+        if isinstance(child, ast.Call)
+        and isinstance(child.func, ast.Attribute)
+        and child.func.attr in MUTATING_METHODS
+    ]
+    # quality: ignore[POT02] - mutations derive from the bounded context.tree AST
+    for child in mutations:
+        context.report(
+            code="POT03",
+            severity="warning",
+            node=child,
+            message=(
+                f"{child.func.attr} grows state inside a loop without a proven bound"
+            ),
+            remedy=(
+                "Bound the loop and resource, stream results, or use a bounded container."
+            ),
+        )
 
 
 def _check_exceptions_and_dynamic_code(context: ReviewContext) -> None:
@@ -966,19 +1739,27 @@ def _if_chain_length(node: ast.If) -> int:
     return count
 
 
+def _is_self_field(target: ast.expr) -> bool:
+    return (
+        isinstance(target, ast.Attribute)
+        and isinstance(target.value, ast.Name)
+        and target.value.id == "self"
+    )
+
+
+def _assignment_targets(node: ast.AST) -> list[ast.expr]:
+    if isinstance(node, ast.Assign):
+        return list(node.targets)
+    return [node.target] if isinstance(node, ast.AnnAssign) else []
+
+
 def _class_assignments(node: ast.ClassDef) -> set[str]:
-    names: set[str] = set()
-    # quality: ignore[POT02] - node belongs to a tree capped at MAX_AST_NODES
-    for child in ast.walk(node):
-        if isinstance(child, (ast.Assign, ast.AnnAssign)):
-            targets = child.targets if isinstance(child, ast.Assign) else [child.target]
-            # quality: ignore[POT02] - assignment target count is capped by AST size
-            for target in targets:
-                if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name):
-                    if target.value.id == "self":
-                        # quality: ignore[POT03] - field names cannot exceed AST nodes
-                        names.add(target.attr)
-    return names
+    return {
+        target.attr
+        for child in ast.walk(node)
+        for target in _assignment_targets(child)
+        if _is_self_field(target) and isinstance(target, ast.Attribute)
+    }
 
 
 def _is_forwarder(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
@@ -1073,30 +1854,40 @@ def _check_classes_and_conditionals(context: ReviewContext) -> None:
             _check_class(context, node)
 
 
+def _first_unreachable(body: Sequence[ast.stmt]) -> ast.stmt | None:
+    terminated = False
+    # quality: ignore[POT02] - body statements are capped by MAX_AST_NODES
+    for statement in body:
+        if terminated:
+            return statement
+        terminated = isinstance(statement, TERMINATORS)
+    return None
+
+
+def _report_dead_code(context: ReviewContext, body: Sequence[ast.stmt]) -> None:
+    statement = _first_unreachable(body)
+    if statement is None:
+        return
+    context.report(
+        code="CS16",
+        severity="warning",
+        node=statement,
+        message="statement is unreachable after an unconditional terminator",
+        remedy=(
+            "Delete the dead statement after confirming no generated/"
+            "reflection entry point."
+        ),
+    )
+
+
 def _check_dead_code(context: ReviewContext) -> None:
     # quality: ignore[POT02] - context.tree was rejected above MAX_AST_NODES
     for parent in ast.walk(context.tree):
         for field in ("body", "orelse", "finalbody"):
             # quality: ignore[POT08] - these optional AST statement fields are fixed by schema
             body = getattr(parent, field, None)
-            if not isinstance(body, list):
-                continue
-            terminated = False
-            # quality: ignore[POT02] - body statements are capped by MAX_AST_NODES
-            for statement in body:
-                if terminated:
-                    context.report(
-                        code="CS16",
-                        severity="warning",
-                        node=statement,
-                        message="statement is unreachable after an unconditional terminator",
-                        remedy=(
-                            "Delete the dead statement after confirming no generated/"
-                            "reflection entry point."
-                        ),
-                    )
-                    break
-                terminated = isinstance(statement, TERMINATORS)
+            if isinstance(body, list):
+                _report_dead_code(context, body)
 
 
 def _check_data_clumps(
@@ -1215,14 +2006,9 @@ def _source_boundary_finding(source: str, path: Path) -> Finding | None:
     return None
 
 
-def analyze_source(source: str, path: Path) -> list[Finding]:
-    boundary_finding = _source_boundary_finding(source, path)
-    if boundary_finding is not None:
-        return [boundary_finding]
-    lines = SourceLines(source)
-    findings = _invalid_suppressions(lines, path)
+def _parse_module(source: str, path: Path, findings: list[Finding]) -> ast.Module | None:
     try:
-        tree = ast.parse(source, filename=str(path))
+        return ast.parse(source, filename=str(path))
     except SyntaxError as error:
         line = error.lineno or 1
         _record_finding(
@@ -1230,30 +2016,64 @@ def analyze_source(source: str, path: Path) -> list[Finding]:
             Finding("PARSE001", "error", str(path), line, line,
                     f"Python syntax error: {error.msg}", "Fix syntax before quality review.")
         )
+        return None
+
+
+def _run_checks(context: ReviewContext, functions: Sequence[FunctionInfo]) -> None:
+    _check_functions(context, functions)
+    _check_docstrings(context, functions)
+    _check_nesting(context, functions)
+    _check_loops(context)
+    _check_exceptions_and_dynamic_code(context)
+    _check_indirection_and_privacy(context)
+    _check_classes_and_conditionals(context)
+    _check_dead_code(context)
+    _check_data_clumps(context, functions)
+    _check_duplicate_bodies(context, functions)
+    _check_module_scope(context)
+
+
+def analyze_source(
+    source: str, path: Path, docstring_style: str = DEFAULT_DOCSTRING_STYLE
+) -> list[Finding]:
+    """Audit one Python source unit and return its deduplicated findings.
+
+    Parameters
+    ----------
+    source : str
+        Complete Python source text for `path`.
+    path : Path
+        Location reported with each finding. The file is not read again.
+    docstring_style : str, default "numpy"
+        Documentation convention the file is expected to follow. Use ``"any"``
+        to accept every supported convention and disable DOC02.
+
+    Returns
+    -------
+    list of Finding
+        Findings sorted by line, then rule code, then message. Parse and limit
+        failures are returned as findings rather than raised.
+    """
+    if docstring_style not in DOCSTRING_STYLES:
+        raise AuditError(f"unknown docstring style: {docstring_style}")
+    boundary_finding = _source_boundary_finding(source, path)
+    if boundary_finding is not None:
+        return [boundary_finding]
+    lines = SourceLines(source)
+    findings = _invalid_suppressions(lines, path)
+    tree = _parse_module(source, path, findings)
+    if tree is None:
         return findings
     try:
         parents = _build_parent_map(tree)
-    except AuditError as error:
-        remedy = "Reduce the source unit or audit a narrower scope."
-        _record_limit(findings, path, str(error), remedy)
-        return findings
-    try:
         functions = _collect_functions(tree)
     except AuditError as error:
         remedy = "Reduce the source unit or audit a narrower scope."
         _record_limit(findings, path, str(error), remedy)
         return findings
-    context = ReviewContext(tree, lines, path, parents, findings)
+    context = ReviewContext(tree, lines, path, parents, findings, docstring_style)
     try:
-        _check_functions(context, functions)
-        _check_loops(context)
-        _check_exceptions_and_dynamic_code(context)
-        _check_indirection_and_privacy(context)
-        _check_classes_and_conditionals(context)
-        _check_dead_code(context)
-        _check_data_clumps(context, functions)
-        _check_duplicate_bodies(context, functions)
-        _check_module_scope(context)
+        _run_checks(context, functions)
     except AuditError as error:
         _record_limit(
             findings,
@@ -1264,7 +2084,9 @@ def analyze_source(source: str, path: Path) -> list[Finding]:
     return sorted(set(findings), key=lambda item: (item.line, item.code, item.message))
 
 
-def _analyze_path(path: Path, remaining_bytes: int) -> tuple[list[Finding], int]:
+def _analyze_path(
+    path: Path, remaining_bytes: int, docstring_style: str
+) -> tuple[list[Finding], int]:
     if remaining_bytes <= 0:
         return ([
             _limit_finding(
@@ -1297,11 +2119,27 @@ def _analyze_path(path: Path, remaining_bytes: int) -> tuple[list[Finding], int]
             Finding("IO001", "error", str(path), 1, 1,
                     f"cannot decode Python source: {error}", "Make the file readable UTF-8 source.")
         ], len(payload))
-    return analyze_source(source, path), len(payload)
+    return analyze_source(source, path, docstring_style), len(payload)
 
 
-def analyze_path(path: Path) -> list[Finding]:
-    return _analyze_path(path, MAX_SOURCE_BYTES)[0]
+def analyze_path(
+    path: Path, docstring_style: str = DEFAULT_DOCSTRING_STYLE
+) -> list[Finding]:
+    """Read one Python file and audit it in isolation.
+
+    Parameters
+    ----------
+    path : Path
+        Python file to read as UTF-8 and audit.
+    docstring_style : str, default "numpy"
+        Documentation convention passed through to `analyze_source`.
+
+    Returns
+    -------
+    list of Finding
+        Findings for this file, including read and decode failures.
+    """
+    return _analyze_path(path, MAX_SOURCE_BYTES, docstring_style)[0]
 
 
 def _intersects_changed_lines(finding: Finding, ranges: Sequence[tuple[int, int]]) -> bool:
@@ -1311,6 +2149,26 @@ def _intersects_changed_lines(finding: Finding, ranges: Sequence[tuple[int, int]
 def filter_changed_findings(
     findings: Iterable[Finding], changed_lines: dict[Path, tuple[tuple[int, int], ...]]
 ) -> list[Finding]:
+    """Keep only findings that intersect the changed lines.
+
+    Parameters
+    ----------
+    findings : iterable of Finding
+        Findings gathered across every audited file.
+    changed_lines : dict
+        Maps a resolved path to its inclusive changed line ranges.
+
+    Returns
+    -------
+    list of Finding
+        Findings overlapping a changed range, plus read, parse, and limit
+        failures for any file in the change set.
+
+    Raises
+    ------
+    AuditError
+        If more than ``MAX_FINDINGS`` findings are supplied.
+    """
     selected_findings = tuple(islice(findings, MAX_FINDINGS + 1))
     if len(selected_findings) > MAX_FINDINGS:
         raise AuditError(f"finding count exceeds {MAX_FINDINGS}")
@@ -1360,22 +2218,38 @@ def _arguments(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--git-diff", action="store_true", help="audit changed Python lines in Git")
     parser.add_argument("--format", choices=("text", "json"), default="text")
     parser.add_argument("--fail-on", choices=("none", "error", "warning"), default="warning")
+    parser.add_argument(
+        "--docstring-style",
+        choices=DOCSTRING_STYLES,
+        default=None,
+        help=(
+            "expected docstring convention; overrides "
+            f"{DOCSTYLE_ENV_VAR} and {CONFIG_FILENAME}. 'any' disables DOC02"
+        ),
+    )
+    parser.add_argument(
+        "--print-docstring-style",
+        action="store_true",
+        help="report the resolved docstring convention and its source, then exit",
+    )
     args = parser.parse_args(argv)
     if args.git_diff and args.paths:
         parser.error("use --git-diff or explicit paths, not both")
-    if not args.git_diff and not args.paths:
+    if not args.print_docstring_style and not args.git_diff and not args.paths:
         parser.error("provide --git-diff or at least one path")
     return args
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = _arguments(sys.argv[1:] if argv is None else argv)
-    try:
-        selection = collect_git_diff(Path.cwd()) if args.git_diff else None
-        paths = selection.paths if selection else tuple(_iter_python_files(args.paths))
-    except AuditError as error:
-        print(f"quality audit: {error}", file=sys.stderr)
-        return 2
+def _print_resolved_style(style: str, source: str, output_format: str) -> int:
+    if output_format == "json":
+        payload = {"style": style, "label": STYLE_LABELS.get(style, style), "source": source}
+        print(json.dumps(payload))
+    else:
+        print(f"{style} (source: {source})")
+    return 0
+
+
+def _audit_paths(paths: Sequence[Path], docstring_style: str) -> list[Finding]:
     findings: list[Finding] = []
     total_bytes = 0
     # quality: ignore[POT02] - paths is rejected above MAX_PYTHON_FILES
@@ -1389,7 +2263,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "Audit a narrower path set or split the scan into bounded scopes.",
             )
             break
-        path_findings, byte_count = _analyze_path(path, remaining_bytes)
+        path_findings, byte_count = _analyze_path(path, remaining_bytes, docstring_style)
         total_bytes += byte_count
         # quality: ignore[POT03] - findings is truncated explicitly at MAX_FINDINGS
         findings.extend(path_findings)
@@ -1404,6 +2278,44 @@ def main(argv: Sequence[str] | None = None) -> int:
             break
         if byte_count > remaining_bytes:
             break
+    return findings
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the audit from the command line.
+
+    The docstring convention is resolved before anything is audited, so a
+    misconfigured style fails fast with an explanation rather than silently
+    auditing against the wrong convention.
+
+    Parameters
+    ----------
+    argv : sequence of str or None, optional
+        Argument list without the program name. ``None`` reads `sys.argv`.
+
+    Returns
+    -------
+    int
+        ``0`` when no finding reaches the `--fail-on` threshold, ``1`` when one
+        does, and ``2`` when the audit could not be completed.
+    """
+    args = _arguments(sys.argv[1:] if argv is None else argv)
+    try:
+        style, source = resolve_docstring_style(
+            args.docstring_style, os.environ, Path.cwd()
+        )
+    except AuditError as error:
+        print(f"quality audit: {error}", file=sys.stderr)
+        return 2
+    if args.print_docstring_style:
+        return _print_resolved_style(style, source, args.format)
+    try:
+        selection = collect_git_diff(Path.cwd()) if args.git_diff else None
+        paths = selection.paths if selection else tuple(_iter_python_files(args.paths))
+    except AuditError as error:
+        print(f"quality audit: {error}", file=sys.stderr)
+        return 2
+    findings = _audit_paths(paths, style)
     if selection:
         findings = filter_changed_findings(findings, selection.changed_lines)
     findings.sort(key=lambda item: (item.path, item.line, item.code))

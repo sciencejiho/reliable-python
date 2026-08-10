@@ -1,0 +1,4 @@
+interface:
+  display_name: "Write Python Docstrings"
+  short_description: "Document public Python in NumPy style"
+  default_prompt: "Use $writing-docstrings to document this Python code in NumPy style."

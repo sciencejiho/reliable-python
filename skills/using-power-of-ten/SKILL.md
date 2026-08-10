@@ -25,7 +25,8 @@ structural change or review.
 ## Working rules
 
 1. Keep control flow simple. Do not use direct or indirect recursion. Do not
-   use exceptions for ordinary branching.
+   use exceptions for ordinary branching. Keep block nesting at four levels or
+   fewer; load `limiting-nesting` when a function goes deeper.
 2. Give every terminating loop a preset upper bound. Make an intentionally
    non-terminating service loop explicit and keep bounded work inside it.
 3. Bound runtime growth. Put ceilings on collections, queues, caches, input
@@ -46,6 +47,16 @@ structural change or review.
 10. Run the project's strictest compiler, linter, type checker, and tests. End
     with zero warnings in the changed scope; fix confusing code instead of
     silencing tools without a written reason.
+
+## Documentation convention
+
+This is a project convention, not one of Holzmann's ten rules. Document every
+public module, class, and function in this project's configured convention,
+which defaults to **NumPy style**; it carries per-parameter types, defaults, and
+constraints that a reader needs to enumerate a function's inputs. Google and
+reST are supported alternates, set per project. The active convention is stated
+at the end of this policy. Load `writing-docstrings` before writing or
+restructuring a docstring.
 
 ## Workflow
 
