@@ -1,7 +1,7 @@
 # Reliable Python
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-0.2.1-informational.svg)](.claude-plugin/plugin.json)
+[![Version](https://img.shields.io/badge/version-0.3.0-informational.svg)](.claude-plugin/plugin.json)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)](skills/review-code-quality/scripts/audit_python.py)
 
