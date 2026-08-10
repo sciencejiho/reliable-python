@@ -10,6 +10,7 @@ report issues, propose changes, and get a pull request merged.
 - [Want a Doc Fix?](#docs)
 - [Issue Submission Guidelines](#submit)
 - [Branches](#branches)
+- [Releases](#releases)
 - [Commits](#commits)
 - [Titles](#titles)
 - [Pull Request Submission Guidelines](#submit-pr)
@@ -96,6 +97,53 @@ commits and tags are available on the remote.
 When work depends on an unmerged branch, stack it: branch from the dependency
 and target the pull request at it, rather than at `develop`. Say so in the
 pull request body.
+
+## <a name="releases"></a> Releases
+
+**A release originates from `main`, and only from `main`, via an annotated tag.**
+
+There is exactly one way a version becomes published:
+
+1. Branch `release/X.Y.Z` from `develop`, or `hotfix/X.Y.Z` from the latest
+   released commit on `main`.
+2. Bump the version and update documentation on that branch. Nothing else.
+3. Merge it into `main` with a non-fast-forward merge.
+4. Tag that commit on `main`: `git tag -a vX.Y.Z -m "vX.Y.Z"`.
+5. Merge the same branch into `develop` so the bump is not lost.
+6. Publish a GitHub Release from the tag, targeting `main`.
+
+Never tag `develop`, a `feature/*` branch, or a `release/*` branch that has not
+yet reached `main`. A tag that is not reachable from `main` is not a release,
+and anything built or installed from it is unreproducible — the branch it came
+from can still be rewritten, but `main` cannot.
+
+### Version locations
+
+A version bump edits five places, and only one of them is enforced by a test:
+
+1. `.claude-plugin/plugin.json`
+2. `.codex-plugin/plugin.json`
+3. `.claude-plugin/marketplace.json`
+4. `PackageConsistencyTests` in `tests/test_audit_python.py` — hardcodes the
+   expected version and fails on drift
+5. The version badge in `README.md` — **not covered by any test**
+
+### Release notes
+
+Every tag gets a GitHub Release whose notes are written from what actually
+changed, by comparing the two tags — not from the commit subjects alone. Use
+the sections that apply:
+
+- **Summary** — what this release is for, in a few sentences. If it is a
+  hardening or maintenance release with no new rules, say so plainly rather
+  than dressing it up.
+- **New Features** — capabilities that did not exist before
+- **Bug Fixes** — defects closed, each naming the failure it prevents
+- **Upgrading** — only when a user has to do something, or when existing
+  behavior changes
+
+State honestly when a release adds nothing new. `v0.2.1` shipped identical rule
+codes to `v0.2.0` and was a hardening release; its notes say exactly that.
 
 ## <a name="commits"></a> Commits
 
