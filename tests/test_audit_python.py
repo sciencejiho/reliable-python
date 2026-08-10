@@ -991,7 +991,7 @@ class PackageConsistencyTests(unittest.TestCase):
         )
         self.assertEqual(
             {claude["version"], codex["version"], entry["version"]},
-            {"0.2.1"},
+            {"0.3.0"},
         )
 
     def test_session_policy_is_reinjected_after_every_start_mode(self) -> None:
