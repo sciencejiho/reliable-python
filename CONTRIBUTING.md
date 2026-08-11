@@ -73,26 +73,32 @@ Include what applies:
 
 ## <a name="branches"></a> Branches
 
-This project uses Git Flow. The production branch is named `main`.
+This project uses a Git Flow variant. The production branch is named `main`.
 
 - `main` contains released code only. Every release commit on `main` has an
-  annotated `vX.Y.Z` tag.
-- `develop` integrates work for the next release.
+  annotated `vX.Y.Z` tag. `main` is never rewritten.
+- `develop` integrates work for the next release, and is what gets released.
 - `feature/*` branches start from `develop` and merge back into `develop`.
 - `bugfix/*` branches start from `develop` and merge back into `develop`. Use
   them for defects that do not require an immediate production release.
-- `release/X.Y.Z` branches start from `develop`. Limit them to release
-  stabilization and version or documentation updates, then merge them into
-  both `main` and `develop`. Tag the resulting release commit on `main` as
-  `vX.Y.Z`.
 - `hotfix/X.Y.Z` branches start from the latest released commit on `main`. Use
   them for urgent defects in a published release, then merge them into both
   `main` and `develop`. Tag the resulting patch release commit on `main` as
   `vX.Y.Z`.
 
-Use non-fast-forward merges for `release/*` and `hotfix/*` so the release
-topology remains visible. Delete short-lived branches only after their merged
-commits and tags are available on the remote.
+**There is no `release/*` branch.** A release is `develop`, frozen and tagged:
+bump the version on `develop`, merge `develop` into `main`, tag `main`. A
+release branch earns its place when a team needs to stabilize a release while
+other work keeps landing on `develop`; here it would only add a branch that
+exists for one commit and a merge commit implying something happened between
+`develop` and `main` when nothing did.
+
+`hotfix/*` keeps its branch for a real reason: it ships *without* whatever else
+is sitting on `develop`, so it cannot be cut from `develop` at all.
+
+Use a non-fast-forward merge into `main` so the release topology stays visible.
+Delete short-lived branches only after their merged commits and tags are
+available on the remote.
 
 When work depends on an unmerged branch, stack it: branch from the dependency
 and target the pull request at it, rather than at `develop`. Say so in the
@@ -104,15 +110,27 @@ pull request body.
 
 There is exactly one way a version becomes published:
 
-1. Branch `release/X.Y.Z` from `develop`, or `hotfix/X.Y.Z` from the latest
-   released commit on `main`.
-2. Bump the version and update documentation on that branch. Nothing else.
-3. Merge it into `main` with a non-fast-forward merge.
-4. Tag that commit on `main`: `git tag -a vX.Y.Z -m "vX.Y.Z"`.
-5. Merge the same branch into `develop` so the bump is not lost.
-6. Publish a GitHub Release from the tag, targeting `main`.
+```sh
+git checkout develop                  # 1. everything to ship is already here
+#                                     # 2. bump the version (five places, below)
+git commit -am "chore: release X.Y.Z"
+git checkout main
+git merge --no-ff develop -m "Merge develop into main"
+git tag -a vX.Y.Z -m "vX.Y.Z"         # 3. tag main, never develop
+git push origin main develop vX.Y.Z
+```
 
-Never tag `develop`, a `feature/*` branch, or a `release/*` branch that has not
+Then publish a GitHub Release from the tag, targeting `main`.
+
+`main` ends up with exactly the tree `develop` had, which is the property worth
+keeping: **a release is `develop`, frozen and tagged.** If `main` and `develop`
+ever differ in content immediately after a release, something went wrong.
+
+A `hotfix/X.Y.Z` is the one exception. It branches from the latest released
+commit on `main`, merges into `main`, gets tagged there, and then merges into
+`develop` so the fix is not lost.
+
+Never tag `develop`, a `feature/*` branch, or a `hotfix/*` branch that has not
 yet reached `main`. A tag that is not reachable from `main` is not a release,
 and anything built or installed from it is unreproducible — the branch it came
 from can still be rewritten, but `main` cannot.
