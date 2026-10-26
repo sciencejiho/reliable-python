@@ -1,5 +1,11 @@
 # Reliable Python
 
+> **Repository moved.** Development, new releases, and issue tracking continue at
+> [reliable-coding-agents/reliable-python](https://github.com/reliable-coding-agents/reliable-python).
+> This repository remains available for historical links. Use the
+> [current installation instructions](https://github.com/reliable-coding-agents/reliable-python#quickstart)
+> instead of the older commands below.
+
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-0.3.0-informational.svg)](.claude-plugin/plugin.json)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
